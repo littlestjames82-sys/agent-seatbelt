@@ -1,0 +1,10 @@
+- id: seatbelt-check-file
+  name: Agent Seatbelt — scan staged scripts
+  description: >-
+    Runs Seatbelt's static verdict pass (--check-file) over staged
+    shell and PowerShell scripts and blocks the commit on a deny-tier
+    finding.
+  entry: python3 hooks/seatbelt_hook.py --check-file
+  language: system
+  types_or: [shell, powershell]
+  pass_filenames: true

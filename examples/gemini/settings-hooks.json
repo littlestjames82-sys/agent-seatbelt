@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command|write_file|replace|read_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"/ABSOLUTE/PATH/TO/agent-seatbelt/hooks/seatbelt_hook.py\"",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}

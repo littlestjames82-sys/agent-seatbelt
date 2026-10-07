@@ -1,0 +1,7 @@
+{
+  "name": "ci",
+  "description": "Non-interactive CI: there is no human to ask, so every ask becomes a deny. Copy to .seatbelt/policy.json in the CI checkout.",
+  "seatbelt_mode": "strict",
+  "ci": true,
+  "$schema": "./schema.json"
+}

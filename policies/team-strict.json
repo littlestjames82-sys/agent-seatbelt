@@ -1,0 +1,10 @@
+{
+  "name": "team-strict",
+  "description": "Strict mode (locked ask-tier becomes deny) for shared repos/branches, plus an overlay deny on history-rewriting commit flags.",
+  "seatbelt_mode": "strict",
+  "deny_patterns": [
+    "--no-verify"
+  ],
+  "escalate_prod": true,
+  "$schema": "./schema.json"
+}

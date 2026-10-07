@@ -1,0 +1,11 @@
+{
+  "$comment": "Team rollout: enable the Seatbelt plugin for every Claude Code session in this project, from the studio marketplace. Copy into .claude/settings.json (project) or ~/.claude/settings.json (user).",
+  "extraKnownMarketplaces": {
+    "ghost-dev-studio": {
+      "source": { "source": "github", "repo": "littlestjames82-sys/agent-seatbelt" }
+    }
+  },
+  "enabledPlugins": {
+    "agent-seatbelt@ghost-dev-studio": true
+  }
+}

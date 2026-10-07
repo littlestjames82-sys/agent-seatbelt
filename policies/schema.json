@@ -1,0 +1,244 @@
+{
+ "$id": "https://github.com/littlestjames82-sys/agent-seatbelt/policies/schema.json",
+ "$schema": "http://json-schema.org/draft-07/schema#",
+ "anyOf": [
+  {
+   "$ref": "#/definitions/overlay"
+  },
+  {
+   "$ref": "#/definitions/plan"
+  }
+ ],
+ "definitions": {
+  "feedIndex": {
+   "additionalProperties": false,
+   "properties": {
+    "entries": {
+     "items": {
+      "additionalProperties": false,
+      "properties": {
+       "bench_case_ids": {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       "date": {
+        "type": "string"
+       },
+       "id": {
+        "type": "string"
+       },
+       "incident": {
+        "type": "string"
+       },
+       "note": {
+        "type": "string"
+       },
+       "rule_ids": {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       "source_url": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "id",
+       "date",
+       "incident",
+       "source_url",
+       "rule_ids",
+       "bench_case_ids"
+      ],
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "feed_version": {
+     "type": "string"
+    },
+    "generated": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "feed_version",
+    "entries"
+   ],
+   "type": "object"
+  },
+  "overlay": {
+   "additionalProperties": false,
+   "properties": {
+    "$schema": {
+     "type": "string"
+    },
+    "allow_patterns": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "ask_patterns": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "ci": {
+     "type": "boolean"
+    },
+    "deny_patterns": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "description": {
+     "type": "string"
+    },
+    "escalate_prod": {
+     "type": "boolean"
+    },
+    "feed": {
+     "type": "boolean"
+    },
+    "mode": {
+     "enum": [
+      "enforce",
+      "audit",
+      "strict"
+     ],
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "rules": {
+     "items": {
+      "additionalProperties": false,
+      "properties": {
+       "effect": {
+        "enum": [
+         "deny",
+         "ask",
+         "allow"
+        ],
+        "type": "string"
+       },
+       "id": {
+        "pattern": "^[a-z0-9][a-z0-9-]*$",
+        "type": "string"
+       },
+       "pattern": {
+        "type": "string"
+       },
+       "reason": {
+        "type": "string"
+       },
+       "remediation": {
+        "type": "string"
+       },
+       "tools": {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       "when": {
+        "type": "object"
+       }
+      },
+      "required": [
+       "id",
+       "effect"
+      ],
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "seatbelt_mode": {
+     "enum": [
+      "enforce",
+      "audit",
+      "strict"
+     ],
+     "type": "string"
+    },
+    "asi": {
+     "type": "string",
+     "pattern": "^ASI(0[1-9]|10)$"
+    }
+   },
+   "type": "object"
+  },
+  "plan": {
+   "additionalProperties": false,
+   "properties": {
+    "allow": {
+     "additionalProperties": false,
+     "properties": {
+      "paths": {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      "resources": {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      "verbs": {
+       "items": {
+        "enum": [
+         "read",
+         "write",
+         "delete",
+         "network",
+         "publish",
+         "deploy",
+         "pay",
+         "test",
+         "build"
+        ],
+        "type": "string"
+       },
+       "type": "array"
+      }
+     },
+     "type": "object"
+    },
+    "created": {
+     "type": "string"
+    },
+    "id": {
+     "type": "string"
+    },
+    "notes": {
+     "type": "string"
+    },
+    "task": {
+     "type": "string"
+    },
+    "ttl_hours": {
+     "exclusiveMinimum": 0,
+     "maximum": 4,
+     "type": "number"
+    }
+   },
+   "required": [
+    "id",
+    "created",
+    "task",
+    "allow"
+   ],
+   "type": "object"
+  }
+ },
+ "title": "Agent Seatbelt policy files"
+}

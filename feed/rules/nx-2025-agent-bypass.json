@@ -1,0 +1,10 @@
+{
+ "deny_patterns": [
+  "--dangerously-skip-permissions",
+  "--dangerously-bypass-approvals-and-sandbox",
+  "--permission-mode bypassPermissions"
+ ],
+ "description": "Disaster Feed entry nx-2025-agent-bypass: never launch an agent CLI with its safety permissions disabled.",
+ "name": "feed-nx-2025-agent-bypass",
+ "asi": "ASI04"
+}

@@ -1,0 +1,11 @@
+{
+ "ask_patterns": [
+  "prisma db push",
+  "drizzle-kit push",
+  "dbmate up",
+  "alembic upgrade head"
+ ],
+ "description": "Disaster Feed entry replit-2025-alias-push: direct schema pushes to a database are ask-tier everywhere.",
+ "name": "feed-replit-2025-alias-push",
+ "asi": "ASI02"
+}

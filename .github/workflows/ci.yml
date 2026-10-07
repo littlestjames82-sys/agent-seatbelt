@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test deps
+        run: pip install pytest build
+      - name: Test suite
+        run: python -m pytest tests/ -q
+      - name: Bench
+        run: python bench/run_bench.py
+      - name: Injection bench
+        run: python bench/run_injection.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: JS policy tests
+        run: |
+          node --test experimental/mods/policy.test.mjs
+          node --test experimental/opencode/seatbelt-opencode.test.mjs
+      - name: Validate plugin manifests
+        continue-on-error: true
+        run: |
+          pip install claude-code || true
+          claude plugin validate . || true

@@ -1,0 +1,9 @@
+{
+  "name": "solo",
+  "description": "Seatbelt defaults for one developer: locked rules as shipped, plus allows for two everyday local commands that otherwise defer.",
+  "allow_patterns": [
+    "npm run build",
+    "docker compose up"
+  ],
+  "$schema": "./schema.json"
+}

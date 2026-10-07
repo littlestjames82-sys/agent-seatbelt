@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-seatbelt"
-version = "0.1.0"
+version = "0.2.0"
 description = "A seatbelt for browser agents: record-first, fail-closed policy gating for agent actions — before they happen."
 readme = "README.md"
 license = "MIT"

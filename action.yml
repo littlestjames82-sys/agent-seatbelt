@@ -1,0 +1,28 @@
+name: "Agent Seatbelt scan"
+description: >-
+  Scan changed shell and PowerShell scripts with Agent Seatbelt's
+  static verdict pass (--check-file) and fail the job on a deny-tier
+  finding. Static analysis of script text — it does not run the
+  scripts, and it is not a substitute for the runtime hook.
+author: "Ghost Developer Studio"
+inputs:
+  files:
+    description: "Space-separated list of script files to scan"
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: Seatbelt static scan
+      shell: bash
+      run: |
+        status=0
+        for f in ${{ inputs.files }}; do
+          echo "== $f"
+          # --check-file exits 1 when a deny-tier line is found,
+          # 2 when the file cannot be read — both fail the job.
+          python3 "${{ github.action_path }}/hooks/seatbelt_hook.py" --check-file "$f" || status=1
+        done
+        exit $status
+branding:
+  icon: "shield"
+  color: "purple"

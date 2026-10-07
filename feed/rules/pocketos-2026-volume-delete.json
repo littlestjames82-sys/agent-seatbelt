@@ -1,0 +1,10 @@
+{
+ "ask_patterns": [
+  "railway volume delete",
+  "deleteVolume",
+  "volume delete"
+ ],
+ "description": "Disaster Feed entry pocketos-2026-volume-delete: volume/database deletion via CLI shapes is ask-tier even outside the locked cloud list.",
+ "name": "feed-pocketos-2026-volume-delete",
+ "asi": "ASI02"
+}

@@ -30,7 +30,7 @@ from .policy import (
     parse_policy_expression,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "CONSEQUENTIAL",

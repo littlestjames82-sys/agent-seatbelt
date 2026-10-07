@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use Seatbelt Bench in your research or product evaluation, please cite it as below."
+title: "Seatbelt Bench: a decision corpus for AI-agent tool-call gating"
+authors:
+  - name: "Ghost Developer Studio"
+version: "1.0"
+date-released: "2026-10-07"
+license: MIT
+repository-code: "https://github.com/littlestjames82-sys/agent-seatbelt"
+abstract: >-
+  206 labeled cases (deny / ask / allow / defer) for pre-tool safety
+  gating of AI coding agents, including shell-evasion patterns,
+  prompt-injection controls, and cases derived from eight real public
+  agent incidents, with a frozen-id versioning policy and an
+  external-runner scoring interface.

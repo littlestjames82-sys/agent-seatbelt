@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": "python3 \"/ABSOLUTE/PATH/TO/agent-seatbelt/hooks/seatbelt_hook.py\""
+      }
+    ]
+  }
+}
