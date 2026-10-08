@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-seatbelt"
+name = "ghost-seatbelt"
 version = "0.2.0"
-description = "A seatbelt for browser agents: record-first, fail-closed policy gating for agent actions — before they happen."
+description = "Deterministic guardrails for AI coding agents — Seatbelt gates what your agent does before it does it."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -23,6 +23,9 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/littlestjames82-sys/agent-seatbelt"
+Repository = "https://github.com/littlestjames82-sys/agent-seatbelt"
+Issues = "https://github.com/littlestjames82-sys/agent-seatbelt/issues"
+Changelog = "https://github.com/littlestjames82-sys/agent-seatbelt/releases"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_seatbelt"]
