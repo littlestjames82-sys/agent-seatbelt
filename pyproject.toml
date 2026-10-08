@@ -31,7 +31,7 @@ Changelog = "https://github.com/littlestjames82-sys/agent-seatbelt/releases"
 packages = ["src/agent_seatbelt"]
 
 [dependency-groups]
-dev = ["pytest>=8.4,<9"]
+dev = ["pytest>=8.4,<10"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
