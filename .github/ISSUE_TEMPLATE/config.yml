@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions & discussion
+    url: https://github.com/littlestjames82-sys/agent-seatbelt/discussions
+    about: Ask how a policy or verdict works, or talk through a rule idea before filing it
+  - name: Agent Seatbelt on PyPI (ghost-seatbelt)
+    url: https://pypi.org/project/ghost-seatbelt/
+    about: The published Python library — releases, files, and version history
+  - name: False positive?
+    url: https://github.com/littlestjames82-sys/agent-seatbelt/issues/new?template=false-positive.md
+    about: Seatbelt denied or escalated something benign — use the false-positive template so the near-miss lands in the bench
