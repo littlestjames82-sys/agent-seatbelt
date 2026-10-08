@@ -1,5 +1,7 @@
 # Agent Seatbelt
 
+[![Agent Seatbelt — a seatbelt for AI coding agents](docs/social-preview.png)](https://github.com/littlestjames82-sys/agent-seatbelt)
+
 [![PyPI](https://img.shields.io/pypi/v/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/)
 [![Downloads](https://img.shields.io/pypi/dm/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
