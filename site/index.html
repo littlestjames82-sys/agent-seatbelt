@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Seatbelt — A seatbelt for AI coding agents</title>
+<meta name="description" content="Agent Seatbelt reads every tool call your AI coding agent makes — before it runs — and denies or escalates the ones that end careers. Deterministic, stdlib-only, 206/206 on the open Seatbelt Bench.">
+<style>
+  :root {
+    --violet: #6716f3;
+    --violet-bright: #8b4dff;
+    --bg: #0b0b10;
+    --panel: #14141d;
+    --panel-2: #1a1a26;
+    --text: #eceaf4;
+    --muted: #a49fc0;
+    --line: #262636;
+    --green: #3ddc97;
+    --amber: #ffb454;
+    --red: #ff6b81;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.6;
+  }
+  a { color: var(--violet-bright); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+  header {
+    padding: 72px 0 40px;
+    text-align: center;
+    background:
+      radial-gradient(600px 300px at 50% -60px, rgba(103, 22, 243, 0.35), transparent 70%),
+      var(--bg);
+  }
+  header img.logo { width: 108px; height: 108px; border-radius: 24px; }
+  .kicker {
+    margin-top: 22px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  h1 {
+    font-size: clamp(40px, 7vw, 68px);
+    line-height: 1.05;
+    margin: 14px 0 6px;
+    font-weight: 800;
+  }
+  h1 .accent { color: var(--violet-bright); }
+  .tagline {
+    font-size: clamp(18px, 3vw, 24px);
+    color: var(--text);
+    max-width: 760px;
+    margin: 14px auto 0;
+  }
+  .tagline em { color: var(--violet-bright); font-style: normal; font-weight: 700; }
+  .sub {
+    color: var(--muted);
+    max-width: 700px;
+    margin: 16px auto 0;
+    font-size: 16px;
+  }
+  .install {
+    margin: 34px auto 0;
+    max-width: 620px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 16px 20px;
+    text-align: left;
+  }
+  .install code {
+    font-family: "Cascadia Code", Consolas, Menlo, monospace;
+    font-size: 17px;
+    color: var(--text);
+  }
+  .install .soon {
+    display: inline-block;
+    margin-left: 10px;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--amber);
+    border: 1px solid var(--amber);
+    border-radius: 999px;
+    padding: 2px 9px;
+    vertical-align: middle;
+  }
+  .install p { color: var(--muted); font-size: 13px; margin-top: 8px; }
+  section { padding: 48px 0 8px; }
+  h2 { font-size: 30px; margin-bottom: 10px; }
+  h2 .accent { color: var(--violet-bright); }
+  .lede { color: var(--muted); max-width: 760px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 18px;
+    margin-top: 26px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 22px;
+  }
+  .card h3 { font-size: 18px; margin-bottom: 8px; }
+  .card p { color: var(--muted); font-size: 15px; }
+  .card .glyph { font-size: 26px; margin-bottom: 10px; }
+  .classes { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+  .chip {
+    font-family: Consolas, Menlo, monospace;
+    font-size: 13px;
+    border-radius: 999px;
+    padding: 4px 12px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+  }
+  .chip.readonly { color: var(--green); }
+  .chip.write { color: var(--amber); }
+  .chip.consequential { color: var(--red); }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 18px;
+    margin-top: 26px;
+    text-align: center;
+  }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 24px 12px;
+  }
+  .stat .num { font-size: 38px; font-weight: 800; color: var(--violet-bright); }
+  .stat .lbl { color: var(--muted); font-size: 13.5px; margin-top: 4px; }
+  pre.trail {
+    background: #08080d;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px;
+    overflow-x: auto;
+    font-family: Consolas, Menlo, monospace;
+    font-size: 13px;
+    color: #c9c4e6;
+    margin-top: 20px;
+  }
+  pre.trail .k { color: var(--violet-bright); }
+  pre.trail .deny { color: var(--red); }
+  .honest {
+    border-left: 3px solid var(--violet);
+    background: var(--panel);
+    padding: 18px 22px;
+    border-radius: 0 12px 12px 0;
+    margin-top: 22px;
+    color: var(--muted);
+    font-size: 15px;
+  }
+  .honest strong { color: var(--text); }
+  footer {
+    margin-top: 64px;
+    padding: 30px 0 46px;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 14px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <img class="logo" src="assets/ghost-developer-studio-logo.png" alt="Ghost Developer Studio logo">
+    <div class="kicker">Ghost Developer Studio</div>
+    <h1>Agent <span class="accent">Seatbelt</span></h1>
+    <p class="tagline">A seatbelt for AI coding agents.<br>
+    <em>It reads the tool call before the tool call happens.</em></p>
+    <p class="sub">
+      One self-contained Python file that reads every tool call <em>before</em>
+      it runs — shell commands, file writes, MCP calls — and denies or
+      escalates the ones that end careers: recursive deletes, secret
+      exfiltration, production deploys, agent-bypass launches, memory
+      poisoning. Every verdict names its rule, its blast radius, and the
+      safer path.
+    </p>
+    <div class="install">
+      <code>$ pip install ghost-seatbelt</code><span class="soon">Live on PyPI</span>
+      <p>v0.2.0 is live on <a href="https://pypi.org/project/ghost-seatbelt/">PyPI</a>
+      and <a href="https://github.com/littlestjames82-sys/agent-seatbelt">GitHub</a>.
+      Also a Claude Code plugin:
+      <code>/plugin marketplace add littlestjames82-sys/agent-seatbelt</code>.
+      Every number below was measured on the current release.</p>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section>
+    <h2>The <span class="accent">wedge</span></h2>
+    <p class="lede">
+      Most guardrails write a nicer incident report. Seatbelt is in the
+      loop <em>before</em> execution — the call doesn't run until the
+      verdict says it can.
+    </p>
+    <div class="grid">
+      <div class="card">
+        <div class="glyph">🛡️</div>
+        <h3>Pre-tool gating</h3>
+        <p>Hooks inspect every shell command, file write, and MCP call
+        before it executes — not in a log review the next morning. The
+        verdict is allow, deny, or escalate, with the reason attached.</p>
+        <div class="classes">
+          <span class="chip readonly">allow</span>
+          <span class="chip write">escalate</span>
+          <span class="chip consequential">deny</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="glyph">🔍</div>
+        <h3>Sees through tricks</h3>
+        <p>Deobfuscation unwraps base64, unicode games, and indirection
+        before judging, and injection flags catch tool output trying to
+        talk the agent into something. The disguise is judged, not the
+        costume.</p>
+      </div>
+      <div class="card">
+        <div class="glyph">📸</div>
+        <h3>Snapshots</h3>
+        <p>File state is snapshotted around agent writes, so what changed
+        is a diff you can read — and a state you can get back to — instead
+        of a surprise in <code>git status</code>.</p>
+      </div>
+      <div class="card">
+        <div class="glyph">🧾</div>
+        <h3>Hash-chained audit</h3>
+        <p>Every verdict lands in a hash-chained audit trail: what was
+        attempted, which rule fired, what the blast radius was, and what
+        happened. Tamper with a link and the chain says so.</p>
+      </div>
+      <div class="card">
+        <div class="glyph">🎛️</div>
+        <h3>Policies, not vibes</h3>
+        <p>Deterministic rules and policy packs. Same call in, same verdict
+        out — every run, every machine. No model in the decision loop, no
+        temperature, no surprises.</p>
+      </div>
+      <div class="card">
+        <div class="glyph">🧩</div>
+        <h3>Every surface</h3>
+        <p>Claude Code plugin, pre-commit hook, GitHub Action, or the single
+        Python file vendored straight into your project. Standard library
+        only — nothing to install, nothing phoning home.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Verified, <span class="accent">not vibes</span></h2>
+    <p class="lede">Measured on the v0.2.0 release, October 2026 — the same
+    bench and suites that ship in the repo.</p>
+    <div class="stats">
+      <div class="stat"><div class="num">206/206</div><div class="lbl">Seatbelt Bench cases passing</div></div>
+      <div class="stat"><div class="num">0</div><div class="lbl">false positives on the bench</div></div>
+      <div class="stat"><div class="num">275/275</div><div class="lbl">pytest tests passing (v0.2.0)</div></div>
+      <div class="stat"><div class="num">1 file</div><div class="lbl">stdlib only · zero dependencies</div></div>
+    </div>
+    <pre class="trail"><span class="k">call</span>     bash · rm -rf ~/projects/client-site
+<span class="k">inspect</span>  deobfuscated · matched rule: recursive-delete
+<span class="k">verdict</span>  <span class="deny">DENIED</span> · blast radius: everything under the target path
+<span class="k">safer</span>    move it to the trash, or name the subdirectory you mean
+<span class="k">audit</span>    verdict + rule + radius written to the hash-chained log</pre>
+    <div class="honest">
+      <strong>The honest limits:</strong> Seatbelt judges the tool call,
+      not the model's intentions — a genuinely novel attack phrased plainly
+      can pass, which is why every verdict is logged and policies are yours
+      to tighten. It gates coding-agent tool calls; it is not a sandbox,
+      and it doesn't replace one.
+    </div>
+  </section>
+
+  <section>
+    <h2>Where it's <span class="accent">headed</span></h2>
+    <p class="lede">
+      Team governance is the next layer — that's GhostGuard, building on
+      the same governor — alongside more policy packs and the bench growing
+      teeth. The roadmap lives in the repo's CHANGELOG and docs.
+    </p>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    Agent Seatbelt — a <strong>Ghost Developer Studio</strong> project · Oakdale, Tennessee · MIT license<br>
+    Live on PyPI and GitHub. The verdict prints before the damage.
+  </div>
+</footer>
+
+</body>
+</html>
