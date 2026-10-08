@@ -1,5 +1,11 @@
 # Agent Seatbelt
 
+[![PyPI](https://img.shields.io/pypi/v/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/)
+[![Downloads](https://img.shields.io/pypi/dm/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/littlestjames82-sys/agent-seatbelt)](https://github.com/littlestjames82-sys/agent-seatbelt/releases)
+[![CI](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml)
+
 **A seatbelt for AI coding agents.** One self-contained Python file
 that reads every tool call *before* it runs — shell commands, file
 writes, MCP calls — and denies or escalates the ones that end
@@ -184,12 +190,14 @@ bench is the argument — run your current tool through
 
 ## The Python library
 
-The original 0.1 library remains: `agent_seatbelt` (policy kernel
-with strictest-wins tiers, locked rules, named decisions, human
-handoff, redacted audit), the governor, and a CLI.
+The Python library ships alongside the hook — current release
+**v0.2.0**, published on PyPI as `ghost-seatbelt` (the import package
+stays `agent_seatbelt`): a policy kernel with strictest-wins tiers,
+locked rules, named decisions, human handoff, redacted audit, the
+governor, and a CLI.
 
 ```bash
-pip install agent-seatbelt
+pip install ghost-seatbelt
 python3 -m agent_seatbelt --help
 ```
 
