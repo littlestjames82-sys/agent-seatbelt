@@ -25,6 +25,8 @@ home — check `tests/test_no_network.py`, it AST-scans the source.
 
 ## Install (verify, then run)
 
+The Python library is live on PyPI as [`ghost-seatbelt`](https://pypi.org/project/ghost-seatbelt/) (v0.2.0): `pip install ghost-seatbelt`. The Claude Code plugin / hook install below is the full Seatbelt setup.
+
 Read `install.py` before you run it — it's short, and installing a
 security tool you haven't read is how the incidents in
 `docs/INCIDENTS.md` happen.
@@ -223,3 +225,16 @@ string (`CONTRIBUTING.md`).
 
 From Ghost Developer Studio, the makers of GhostGuard — the
 governance layer for autonomous systems.
+
+## From Ghost Developer Studio
+
+Agent Seatbelt is one part of the studio's agent-infrastructure family:
+
+- **Visual roadmap board** — where every studio product stands, in one picture: [ghost-roadmaps](https://github.com/littlestjames82-sys/ghost-roadmaps)
+- **GhostGuard** — the governance layer for autonomous systems: [ghostguard](https://github.com/littlestjames82-sys/ghostguard)
+- **GhostBus** — agent-to-agent message bus and shared workspace, exposed as an MCP server: [ghostbus](https://github.com/littlestjames82-sys/ghostbus)
+- **Ghost Bridge** — MCP bridge + self-hostable relay for handing tasks to a personal agent, with scoped keys and approvals: [ghost-bridge](https://github.com/littlestjames82-sys/ghost-bridge)
+- **Ghost Hands** — governed, recorded, replayable agent hands for the web: [ghost-hands](https://github.com/littlestjames82-sys/ghost-hands)
+- **Ghost Developer Studio storefront** — [storefront](https://github.com/littlestjames82-sys/storefront)
+
+Built in public by Ryan Cotten / Ghost Developer Studio.
