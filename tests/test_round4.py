@@ -225,7 +225,7 @@ def test_version_consistency():
     pyproject = (ROOT / "pyproject.toml").read_text()
     init = (ROOT / "src" / "agent_seatbelt" / "__init__.py").read_text()
     v = plugin["version"]
-    assert v == "0.2.0"
+    assert v == "0.3.0"
     assert 'version = "%s"' % v in pyproject
     assert '__version__ = "%s"' % v in init
     assert hook.VERSION == v

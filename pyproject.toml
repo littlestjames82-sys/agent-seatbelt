@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ghost-seatbelt"
-version = "0.2.0"
+version = "0.3.0"
 description = "Deterministic guardrails for AI coding agents — Seatbelt gates what your agent does before it does it."
 readme = "README.md"
 license = "MIT"

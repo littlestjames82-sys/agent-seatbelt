@@ -106,6 +106,24 @@
     "feed": {
      "type": "boolean"
     },
+    "judge": {
+     "additionalProperties": false,
+     "description": "Optional judge command (round 9): a local command consulted on allow/ask verdicts that may only escalate one tier. Off when absent.",
+     "properties": {
+      "command": {
+       "type": "string"
+      },
+      "enabled": {
+       "type": "boolean"
+      },
+      "timeout_ms": {
+       "maximum": 30000,
+       "minimum": 100,
+       "type": "integer"
+      }
+     },
+     "type": "object"
+    },
     "mode": {
      "enum": [
       "enforce",

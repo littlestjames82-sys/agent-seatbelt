@@ -1,6 +1,6 @@
 {
   "name": "agent-seatbelt",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Record-first, fail-closed policy gate for coding agents: blocks destructive Bash/PowerShell, deploys, secret exfiltration and persistence changes \u2014 and names the safer path.",
   "author": {
     "name": "Ghost Developer Studio"

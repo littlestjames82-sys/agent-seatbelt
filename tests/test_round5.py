@@ -43,7 +43,16 @@ def snapshots(cwd):
     base = Path(cwd) / ".seatbelt" / "snapshots"
     if not base.is_dir():
         return []
-    return sorted(d.name for d in base.iterdir() if d.is_dir())
+    # Newest LAST, by directory creation time — NOT by name.
+    # Snapshot ids are <second-resolution-ts>-<uuid6>, so two
+    # snapshots taken within the same second sort by their random
+    # uuid suffix, and name order stops being time order (this made
+    # test_restore_reverts_edit_and_is_undoable flaky: its [-1]
+    # "newest" pick was a coin flip on same-second snapshots).
+    dirs = [d for d in base.iterdir() if d.is_dir()]
+    dirs.sort(key=lambda d: (d.stat().st_ctime_ns,
+                             d.stat().st_mtime_ns, d.name))
+    return [d.name for d in dirs]
 
 
 def test_snapshot_on_ask_and_restore_deleted_file(tmp_path):

@@ -1,13 +1,5 @@
 # Agent Seatbelt
 
-[![Agent Seatbelt — a seatbelt for AI coding agents](docs/social-preview.png)](https://github.com/littlestjames82-sys/agent-seatbelt)
-
-[![PyPI](https://img.shields.io/pypi/v/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/)
-[![Downloads](https://img.shields.io/pypi/dm/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/littlestjames82-sys/agent-seatbelt)](https://github.com/littlestjames82-sys/agent-seatbelt/releases)
-[![CI](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml)
-
 **A seatbelt for AI coding agents.** One self-contained Python file
 that reads every tool call *before* it runs — shell commands, file
 writes, MCP calls — and denies or escalates the ones that end
@@ -24,8 +16,6 @@ No network. No telemetry. No dependencies. The hook never phones
 home — check `tests/test_no_network.py`, it AST-scans the source.
 
 ## Install (verify, then run)
-
-The Python library is live on PyPI as [`ghost-seatbelt`](https://pypi.org/project/ghost-seatbelt/) (v0.2.0): `pip install ghost-seatbelt`. The Claude Code plugin / hook install below is the full Seatbelt setup.
 
 Read `install.py` before you run it — it's short, and installing a
 security tool you haven't read is how the incidents in
@@ -96,6 +86,18 @@ policy in your browser: **`docs/playground.html`** (open from disk).
 - **MCP rug-pull watch.** Server configs (env **key names only —
   never values**) and tool surfaces are fingerprinted at baseline;
   drift escalates MCP verdicts until a human re-baselines.
+- **Judge escalation seam (opt-in, off by default).** Point
+  Seatbelt at a local judge command *you* configure: on allow/ask
+  verdicts it may raise the verdict exactly one tier — and it can
+  never lower, clear, or suppress anything. Malformed, slow, or
+  verdict-shaped replies are ignored and audit-logged; the
+  deterministic verdict is always the floor (`docs/JUDGE.md`).
+- **Skill & plugin drift watch.** A human-filed baseline of
+  sha256+size fingerprints (never file contents) for installed
+  skills, commands, hooks, and plugin manifests. Drift is reported
+  at SessionStart and via `--skills`, audit-logged, and — in
+  strict/CI mode only — escalates the first call after the change
+  one tier. Detection, not prevention (`docs/SKILL_DRIFT.md`).
 - **Flight plans.** Declare the session's scope
   (`.seatbelt/plan.json`): ask-tier actions inside it stop
   prompting; denials and locked rules are never covered; off-plan
@@ -194,11 +196,9 @@ bench is the argument — run your current tool through
 
 ## The Python library
 
-The Python library ships alongside the hook — current release
-**v0.2.0**, published on PyPI as `ghost-seatbelt` (the import package
-stays `agent_seatbelt`): a policy kernel with strictest-wins tiers,
-locked rules, named decisions, human handoff, redacted audit, the
-governor, and a CLI.
+The original 0.1 library remains: `agent_seatbelt` (policy kernel
+with strictest-wins tiers, locked rules, named decisions, human
+handoff, redacted audit), the governor, and a CLI.
 
 ```bash
 pip install ghost-seatbelt
@@ -210,12 +210,13 @@ python3 -m agent_seatbelt --help
 `docs/BENCH.md` (all the numbers) · `docs/DEMO.md` ·
 `docs/INCIDENTS.md` · `docs/THREAT_MODEL.md` · `docs/AGENTS.md` ·
 `docs/SNAPSHOTS.md` · `docs/INJECTION.md` · `docs/BRAIN.md` ·
+`docs/JUDGE.md` · `docs/SKILL_DRIFT.md` ·
 `docs/COMPLIANCE.md` · `docs/TEAM_ADOPTION.md` ·
 `docs/FEED_RUNBOOK.md` · `docs/VERIFICATION.md` ·
 `docs/CLAIMS_AUDIT.md` · `bench/README.md` (score anything)
 
 Slash commands: `/agent-seatbelt:status`, `:report`, `:selftest`,
-`:check`, `:doctor`, `:restore`, `:plan`.
+`:check`, `:doctor`, `:restore`, `:plan`, `:skills`.
 
 MIT licensed. Contributions follow one law — no detector without
 bench cases (destructive AND benign near-miss) and a remediation
@@ -225,16 +226,3 @@ string (`CONTRIBUTING.md`).
 
 From Ghost Developer Studio, the makers of GhostGuard — the
 governance layer for autonomous systems.
-
-## From Ghost Developer Studio
-
-Agent Seatbelt is one part of the studio's agent-infrastructure family:
-
-- **Visual roadmap board** — where every studio product stands, in one picture: [ghost-roadmaps](https://github.com/littlestjames82-sys/ghost-roadmaps)
-- **GhostGuard** — the governance layer for autonomous systems: [ghostguard](https://github.com/littlestjames82-sys/ghostguard)
-- **GhostBus** — agent-to-agent message bus and shared workspace, exposed as an MCP server: [ghostbus](https://github.com/littlestjames82-sys/ghostbus)
-- **Ghost Bridge** — MCP bridge + self-hostable relay for handing tasks to a personal agent, with scoped keys and approvals: [ghost-bridge](https://github.com/littlestjames82-sys/ghost-bridge)
-- **Ghost Hands** — governed, recorded, replayable agent hands for the web: [ghost-hands](https://github.com/littlestjames82-sys/ghost-hands)
-- **Ghost Developer Studio storefront** — [storefront](https://github.com/littlestjames82-sys/storefront)
-
-Built in public by Ryan Cotten / Ghost Developer Studio.

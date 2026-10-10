@@ -54,7 +54,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 GATED_TOOLS = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 VALID_MODES = {"enforce", "audit", "strict", "shadow"}
@@ -5589,6 +5589,662 @@ def main_r8(argv=None):
 
 
 main = main_r8
+
+
+# =====================================================================
+# SHINE ROUND 9 (v0.3.0): J1 judge escalation seam + J2 skill/plugin
+# drift watch.
+#
+# J1 — the judge. An OPTIONAL, user-configured local command that sees
+# the deterministic verdict on allow/ask-tier calls and may raise it
+# exactly ONE tier (allow->ask, ask->deny). It can never lower, clear,
+# or suppress anything: replies that try are ignored and audit-logged
+# as anomalies, and malformed/timeout/crash replies leave the
+# deterministic verdict untouched. Off by default; in audit/shadow
+# modes (observe-only) it never runs at all. Enforcement lives here,
+# never in the judge.
+#
+# J2 — skill & plugin drift. A human-filed baseline of sha256+size
+# fingerprints for the installed skill/plugin surface (project +
+# user scope; names and hashes only, never contents). Drift is
+# surfaced at SessionStart and via --skills, audit-logged once per
+# distinct drift set, and never blocks by itself in solo/enforce
+# mode. In strict/CI mode the FIRST escalatable call after a drift
+# is raised one tier (the MCP rug-pull precedent from round 7).
+# Re-baselining is explicit and audit-logged; nothing auto-updates.
+# =====================================================================
+
+REMEDIATIONS.update({
+    "seatbelt-judge": "A configured judge raised this verdict one tier. "
+                      "The judge can only ever make Seatbelt stricter; "
+                      "if the escalation is wrong, fix or disable the "
+                      "judge in .seatbelt/policy.json — the "
+                      "deterministic verdict underneath is unchanged.",
+    "seatbelt-skill-drift": "Skill/plugin files differ from the human "
+                            "baseline. Review with --skills; if the "
+                            "change was yours, re-baseline with "
+                            "--skills-baseline --accept. If it was "
+                            "not, treat the changed skills as "
+                            "untrusted until reviewed.",
+    "seatbelt-skill-baseline": "The skill baseline moves only by a "
+                               "human running --skills-baseline "
+                               "--accept.",
+})
+
+_ASI_BY_RULE.update({
+    "seatbelt-judge": "ASI02",
+    "seatbelt-skill-drift": "ASI04",
+    "seatbelt-skill-baseline": "ASI04",
+})
+
+
+# ── J1: the judge seam ────────────────────────────────────────────────
+
+_JUDGE_REASON_CAP = 200
+_JUDGE_STDOUT_CAP = 256 * 1024
+_JUDGE_CLEAR_KEYS = ("decision", "verdict", "allow", "clear",
+                     "suppress", "override", "permissionDecision")
+
+
+def _judge_config(cwd):
+    """The configured judge, or None. Config follows the policy-file
+    pattern: .seatbelt/policy.json -> "judge": {"command": ...,
+    "timeout_ms": ...}; SEATBELT_JUDGE_COMMAND /
+    SEATBELT_JUDGE_TIMEOUT_MS override it. No command = no judge:
+    the seam then costs one small file read and nothing else."""
+    cfg = {}
+    try:
+        doc = json.loads((Path(cwd) / ".seatbelt" / "policy.json")
+                         .read_text(encoding="utf-8"))
+        if isinstance(doc, dict) and isinstance(doc.get("judge"), dict):
+            cfg = doc["judge"]
+    except Exception:
+        cfg = {}
+    env_cmd = os.environ.get("SEATBELT_JUDGE_COMMAND", "")
+    if cfg.get("enabled") is False and not env_cmd.strip():
+        return None
+    command = env_cmd.strip() or cfg.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    raw_timeout = os.environ.get("SEATBELT_JUDGE_TIMEOUT_MS") or \
+        cfg.get("timeout_ms", 3000)
+    try:
+        timeout_ms = int(raw_timeout)
+    except Exception:
+        timeout_ms = 3000
+    timeout_ms = max(100, min(timeout_ms, 30000))
+    return {"command": command.strip(), "timeout_ms": timeout_ms}
+
+
+def _judge_invoke(cfg, brief):
+    """Run the judge once. Returns (outcome, judge_reason) with
+    outcome in escalated | no-raise | timeout | crash | malformed |
+    clear-attempt. Only 'escalated' may change a verdict, and only
+    ever one tier up — enforced here and by the caller, never
+    trusted to the judge's own output."""
+    try:
+        proc = subprocess.run(cfg["command"], shell=True,
+                              input=json.dumps(brief),
+                              capture_output=True, text=True,
+                              timeout=cfg["timeout_ms"] / 1000.0)
+    except subprocess.TimeoutExpired:
+        return "timeout", ""
+    except Exception:
+        return "crash", ""
+    if proc.returncode != 0:
+        return "crash", ""
+    try:
+        reply = json.loads((proc.stdout or "").strip()
+                           [:_JUDGE_STDOUT_CAP])
+    except Exception:
+        return "malformed", ""
+    if not isinstance(reply, dict):
+        return "malformed", ""
+    if any(k in reply for k in _JUDGE_CLEAR_KEYS):
+        # The reply tried to speak in verdicts — including attempts
+        # to clear or lower one. Verdicts are not the judge's to
+        # give: the whole reply is ignored and logged as an anomaly.
+        return "clear-attempt", ""
+    esc = reply.get("escalate")
+    if not isinstance(esc, bool):
+        return "malformed", ""
+    if not esc:
+        return "no-raise", ""
+    reason = reply.get("reason")
+    if not isinstance(reason, str):
+        reason = ""
+    return "escalated", _sanitize_value(reason)[:_JUDGE_REASON_CAP]
+
+
+def _judge_eval_record(cwd, session_id, tool_name):
+    """(record, plan_covered) for the call the inner layers just
+    decided: the newest hook-event audit record for this session +
+    tool, and whether a flight plan covered (de-escalated) it
+    afterwards. No record => the tool was never gated or evaluated,
+    so there is no deterministic verdict for a judge to raise."""
+    record = None
+    plan_covered = False
+    for row in _read_audit_tail(cwd, 60):
+        if row.get("session_id") != session_id:
+            continue
+        if row.get("event") in ("PreToolUse", "BeforeTool",
+                                "preToolUse") \
+                and row.get("tool_name") == tool_name:
+            record = row
+            plan_covered = False
+        elif record is not None and row.get("event") == "plan" \
+                and row.get("decision") == "on-plan-defer":
+            plan_covered = True
+    return record, plan_covered
+
+
+def _semantic_tier(decision, reason, agent_key):
+    """Map an emitted envelope to its semantic tier. Gemini has no
+    ask envelope — an ask is transported as a deny whose reason
+    carries the Seatbelt ASK marker — so recognise it here."""
+    if decision == "ask":
+        return "ask"
+    if decision == "deny":
+        if agent_key == "gemini" and reason and "Seatbelt ASK" in reason:
+            return "ask"
+        return "deny"
+    return "allow"
+
+
+def _r9_judge(payload, cwd, text):
+    """Apply the J1 seam to a finished PreToolUse envelope. Returns
+    the (possibly rewritten) envelope text. The deterministic
+    verdict is already final in `text`; this layer can only raise
+    it one tier, and only when a judge is configured."""
+    event = payload.get("hook_event_name") or \
+        payload.get("hookEventName") or ""
+    tool_name = payload.get("tool_name") or payload.get("toolName") or ""
+    session_id = payload.get("session_id") or \
+        payload.get("sessionId") or ""
+    agent = _agent_for(payload, event)
+    agent_key = agent if agent in ("claude", "gemini", "cursor") \
+        else "claude"
+    decision, reason = _parse_envelope(text, agent_key)
+    tier = _semantic_tier(decision, reason, agent_key)
+    if tier == "deny":
+        return text  # a deny is final; the judge never runs on one
+    _overlay9, mode = _resolve_mode_overlay(cwd)
+    if mode in ("audit", "shadow"):
+        return text  # observe-only modes emit nothing to escalate
+    cfg = _judge_config(cwd)
+    if cfg is None:
+        return text
+    record, plan_covered = _judge_eval_record(cwd, session_id, tool_name)
+    if record is None or plan_covered:
+        return text
+    brief = {
+        "tool": tool_name,
+        "agent": agent,
+        "action": _target_summary(
+            tool_name, payload.get("tool_input") or {}),
+        "verdict": tier,
+        "rules": [record["rule_id"]] if record.get("rule_id") else [],
+        "cwd": str(cwd),
+        "taint": bool(_taint_active(cwd)),
+        "session_id": session_id,
+    }
+    outcome, judge_reason = _judge_invoke(cfg, brief)
+    audit = {"ts": _now(), "event": event, "session_id": session_id,
+             "cwd": cwd, "tool_name": tool_name,
+             "rule_id": "seatbelt-judge", "judge_outcome": outcome,
+             "from_verdict": tier, "command": cfg["command"][:120]}
+    if outcome == "escalated":
+        new_tier = "ask" if tier == "allow" else "deny"
+        audit["decision"] = new_tier
+        audit["judge_reason"] = judge_reason
+        try:
+            write_audit(audit, cwd)
+        except Exception:
+            pass
+        note = (" Judge raised this verdict (%s -> %s): %s"
+                % (tier, new_tier, judge_reason or "no reason given"))
+        return _rewrite_envelope(agent_key, new_tier,
+                                 (reason or "") + note)
+    audit["decision"] = "flagged" if outcome not in ("no-raise",) \
+        else ("defer" if tier == "allow" else tier)
+    try:
+        write_audit(audit, cwd)
+    except Exception:
+        pass
+    return text
+
+
+# ── J2: skill & plugin drift watch ───────────────────────────────────
+
+_SKILL_HASH_CAP = 16 * 1024 * 1024
+_SKILL_FILE_CAP = 2000
+_SKILL_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".seatbelt"}
+_SKILL_HOOK_SUFFIXES = {".py", ".sh", ".js", ".ts", ".json", ".md"}
+
+
+def _skill_baseline_path(cwd):
+    return Path(cwd) / ".seatbelt" / "skills-baseline.json"
+
+
+def _skill_state_path(cwd):
+    return Path(cwd) / ".seatbelt" / "skills-state.json"
+
+
+def _skill_files(cwd):
+    """Discover the installed skill/plugin surface: sorted, deduped
+    (abspath, scope) pairs. Categories: SKILL.md files, commands
+    *.md, hooks files, .claude-plugin manifests — under project
+    .claude/, the project root (plugin-repo layout), and user
+    ~/.claude/. Bounded by a file-count cap and skip dirs."""
+    proj = Path(cwd)
+    home = Path.home()
+    found = {}
+
+    def walk_files(base):
+        if not base.is_dir():
+            return
+        for root, dirs, files in os.walk(base):
+            dirs[:] = sorted(d for d in dirs
+                             if d not in _SKILL_SKIP_DIRS)
+            for name in sorted(files):
+                yield Path(root) / name
+
+    def collect(base, scope, pred):
+        for p in walk_files(base):
+            if len(found) >= _SKILL_FILE_CAP:
+                return
+            if not pred(p):
+                continue
+            try:
+                rp = str(p.resolve())
+            except Exception:
+                rp = str(p)
+            if rp not in found:
+                found[rp] = scope
+
+    for base, scope in ((proj / ".claude", "project"),
+                        (home / ".claude", "user")):
+        collect(base / "skills", scope, lambda p: p.name == "SKILL.md")
+        collect(base / "commands", scope, lambda p: p.suffix == ".md")
+        collect(base / "hooks", scope,
+                lambda p: p.suffix in _SKILL_HOOK_SUFFIXES)
+        collect(base / "plugins", scope,
+                lambda p: p.name == "SKILL.md" or
+                (p.parent.name == ".claude-plugin"
+                 and p.suffix == ".json"))
+    # Plugin-repo layout at the project root (this repo's own shape).
+    collect(proj / "skills", "project", lambda p: p.name == "SKILL.md")
+    collect(proj / "commands", "project", lambda p: p.suffix == ".md")
+    collect(proj / "hooks", "project",
+            lambda p: p.suffix in _SKILL_HOOK_SUFFIXES)
+    collect(proj / ".claude-plugin", "project",
+            lambda p: p.suffix == ".json")
+    return sorted(found.items())
+
+
+def _skill_fingerprint(path):
+    """{"sha256", "size", "partial"} — full-content hash up to the
+    cap; above it, a hash of size + head + tail (partial=True says
+    so on the record)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            if size <= _SKILL_HASH_CAP:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                return {"sha256": h.hexdigest(), "size": size,
+                        "partial": False}
+            head = fh.read(65536)
+            fh.seek(max(0, size - 65536))
+            tail = fh.read(65536)
+            h.update(str(size).encode())
+            h.update(head)
+            h.update(tail)
+            return {"sha256": h.hexdigest(), "size": size,
+                    "partial": True}
+    except OSError:
+        return None
+
+
+def _skill_snapshot(cwd):
+    files = {}
+    discovered = _skill_files(cwd)
+    for path, scope in discovered:
+        fp = _skill_fingerprint(path)
+        if fp is None:
+            continue
+        fp["scope"] = scope
+        files[path] = fp
+    return files, len(discovered) >= _SKILL_FILE_CAP
+
+
+def _skill_baseline(cwd):
+    try:
+        doc = json.loads(_skill_baseline_path(cwd)
+                         .read_text(encoding="utf-8"))
+        return doc if isinstance(doc, dict) else None
+    except Exception:
+        return None
+
+
+def _skill_state(cwd):
+    try:
+        doc = json.loads(_skill_state_path(cwd)
+                         .read_text(encoding="utf-8"))
+        return doc if isinstance(doc, dict) else {}
+    except Exception:
+        return {}
+
+
+def _skill_state_save(cwd, state):
+    try:
+        path = _skill_state_path(cwd)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def run_skills_baseline(accept=False, out=sys.stdout):
+    cwd = os.getcwd()
+    existing = _skill_baseline(cwd)
+    if existing and not accept:
+        out.write("Skill baseline already exists (%d files, created "
+                  "%s).\nThe baseline moves ONLY by a human running: "
+                  "--skills-baseline --accept\n"
+                  % (len(existing.get("files", {})),
+                     existing.get("created", "?")))
+        return 0
+    files, capped = _skill_snapshot(cwd)
+    doc = {"created": _now(), "surface": "skills", "files": files,
+           "capped": capped}
+    try:
+        path = _skill_baseline_path(cwd)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+    except OSError as exc:
+        out.write("Could not write skill baseline: %s\n" % exc)
+        return 1
+    # A fresh baseline defines "no drift": clear the drift memory.
+    _skill_state_save(cwd, {})
+    if accept:
+        write_audit({"ts": _now(), "event": "skills-baseline",
+                     "session_id": "", "cwd": cwd,
+                     "rule_id": "seatbelt-skill-baseline",
+                     "decision": "accepted", "files": len(files)}, cwd)
+    out.write("Skill baseline %s: %d file(s) fingerprinted (sha256 + "
+              "size only - file contents are never copied) to %s\n"
+              % ("accepted" if accept else "created", len(files),
+                 _skill_baseline_path(cwd)))
+    if capped:
+        out.write("NOTE: discovery hit the %d-file cap; the baseline "
+                  "covers the first %d files in sorted order.\n"
+                  % (_SKILL_FILE_CAP, _SKILL_FILE_CAP))
+    return 0
+
+
+def _skill_drift(cwd):
+    """(entries, digest) or (None, None): entries are
+    {"path", "scope", "kind"} with kind changed|new|deleted."""
+    baseline = _skill_baseline(cwd)
+    if not baseline:
+        return None, None
+    current, _capped = _skill_snapshot(cwd)
+    base_files = baseline.get("files", {})
+    entries = []
+    for path, base in base_files.items():
+        cur = current.get(path)
+        if cur is None:
+            entries.append({"path": path,
+                            "scope": base.get("scope", ""),
+                            "kind": "deleted"})
+        elif cur["sha256"] != base["sha256"] or \
+                cur["size"] != base["size"]:
+            entries.append({"path": path,
+                            "scope": base.get("scope", ""),
+                            "kind": "changed"})
+    for path, cur in current.items():
+        if path not in base_files:
+            entries.append({"path": path,
+                            "scope": cur.get("scope", ""),
+                            "kind": "new"})
+    if not entries:
+        return None, None
+    entries.sort(key=lambda e: e["path"])
+    digest = hashlib.sha256(json.dumps(
+        [(e["path"], e["kind"]) for e in entries],
+        sort_keys=True).encode()).hexdigest()
+    return entries, digest
+
+
+def _skill_drift_block(cwd):
+    """(text, digest) when drift exists AND this exact drift set has
+    not been surfaced yet; writes the SessionStart audit event once
+    per distinct drift set (the brain-drift dedupe precedent)."""
+    entries, digest = _skill_drift(cwd)
+    if not entries:
+        return None, None
+    state = _skill_state(cwd)
+    if state.get("last_drift_hash") == digest:
+        return None, digest
+    state["last_drift_hash"] = digest
+    _skill_state_save(cwd, state)
+    try:
+        write_audit({"ts": _now(), "event": "SessionStart",
+                     "session_id": "", "cwd": cwd,
+                     "rule_id": "seatbelt-skill-drift",
+                     "decision": "flagged",
+                     "drift_paths": [e["path"] for e in entries][:20],
+                     "kinds": {k: sum(1 for e in entries
+                                       if e["kind"] == k)
+                               for k in ("changed", "new",
+                                          "deleted")}}, cwd)
+    except Exception:
+        pass
+    names = ["%s (%s)" % (e["path"].rsplit("/", 1)[-1], e["kind"])
+             for e in entries[:3]]
+    more = " +%d more" % (len(entries) - 3) if len(entries) > 3 else ""
+    text = ("🧩 Skill drift: %d skill/plugin file(s) differ from the "
+            "human baseline - %s%s. Run `python3 hooks/seatbelt_hook.py "
+            "--skills` to review; if the change was yours, re-baseline "
+            "with --skills-baseline --accept."
+            % (len(entries), "; ".join(names), more))
+    return text, digest
+
+
+def run_skills(out=sys.stdout):
+    cwd = os.getcwd()
+    baseline = _skill_baseline(cwd)
+    if not baseline:
+        out.write("No skill baseline yet. Create one (human only): "
+                  "--skills-baseline\n")
+        return 0
+    entries, _digest = _skill_drift(cwd)
+    if not entries:
+        out.write("Skill drift: none. %d watched file(s) match the "
+                  "baseline from %s.\n"
+                  % (len(baseline.get("files", {})),
+                     baseline.get("created", "?")))
+        return 0
+    out.write("Skill drift report (baseline %s):\n"
+              % baseline.get("created"))
+    for e in entries:
+        out.write("  %-8s [%s] %s\n"
+                  % (e["kind"], e["scope"] or "-", e["path"]))
+    out.write("\nDrift detects change, not malice: a legitimate "
+              "update and a tampered skill look identical here. To "
+              "accept this drift as the new normal (human only): "
+              "--skills-baseline --accept\n")
+    return 0
+
+
+def _r9_skill_escalation(payload, cwd, text):
+    """Strict/CI only: raise the FIRST escalatable call after a
+    skill drift one tier, once per distinct drift set. Solo/enforce
+    mode returns the envelope untouched — there, drift is report +
+    audit only."""
+    overlay, mode = _resolve_mode_overlay(cwd)
+    if mode in ("audit", "shadow"):
+        return text
+    if not (mode == "strict" or overlay.get("ci")):
+        return text
+    entries, digest = _skill_drift(cwd)
+    if not entries:
+        return text
+    state = _skill_state(cwd)
+    if state.get("escalated_hash") == digest:
+        return text  # already surfaced once for this exact drift set
+    event = payload.get("hook_event_name") or \
+        payload.get("hookEventName") or ""
+    agent = _agent_for(payload, event)
+    agent_key = agent if agent in ("claude", "gemini", "cursor") \
+        else "claude"
+    decision, reason = _parse_envelope(text, agent_key)
+    tier = _semantic_tier(decision, reason, agent_key)
+    if tier == "deny":
+        return text  # already stopped; don't burn the one escalation
+    new_tier = "ask" if tier == "allow" else "deny"
+    state["escalated_hash"] = digest
+    _skill_state_save(cwd, state)
+    note = (" Skill drift: %d skill/plugin file(s) differ from the "
+            "human baseline and this policy is strict/CI, so the "
+            "first call after the drift is escalated one tier. "
+            "Review with --skills; re-baseline only if the change "
+            "was yours." % len(entries))
+    try:
+        write_audit({"ts": _now(), "event": event,
+                     "session_id": payload.get("session_id") or "",
+                     "cwd": cwd,
+                     "tool_name": payload.get("tool_name") or "",
+                     "rule_id": "seatbelt-skill-drift",
+                     "decision": new_tier,
+                     "outcome": "escalated-first-call",
+                     "from_verdict": tier,
+                     "drift_entries": len(entries)}, cwd)
+    except Exception:
+        pass
+    return _rewrite_envelope(agent_key, new_tier,
+                             (reason or "") + note)
+
+
+# ── Round 9 wrappers ──────────────────────────────────────────────────
+
+_run_hook_r8 = run_hook
+
+
+def run_hook_r9(text):
+    import contextlib
+    import io
+    try:
+        payload = json.loads(text) if text and text.strip() else {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict) or payload.get("hookName"):
+        return _run_hook_r8(text)  # Cline + malformed: r8's contract
+    event = payload.get("hook_event_name") or \
+        payload.get("hookEventName") or ""
+    cwd = payload.get("cwd") or os.getcwd()
+    if event == "SessionStart":
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _run_hook_r8(text)
+        out_text = buf.getvalue()
+        block, _digest = _skill_drift_block(cwd)
+        if block and out_text.strip():
+            try:
+                doc = json.loads(out_text)
+                doc["hookSpecificOutput"]["additionalContext"] += \
+                    " " + block
+                out_text = json.dumps(doc) + "\n"
+            except Exception:
+                pass
+        sys.stdout.write(out_text)
+        return rc
+    if event in ("PreToolUse", "BeforeTool", "preToolUse"):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _run_hook_r8(text)
+        out_text = buf.getvalue()
+        out_text = _r9_skill_escalation(payload, cwd, out_text)
+        out_text = _r9_judge(payload, cwd, out_text)
+        sys.stdout.write(out_text)
+        return rc
+    return _run_hook_r8(text)
+
+
+run_hook = run_hook_r9
+
+_run_doctor_r8 = run_doctor
+
+
+def run_doctor_r9(out=sys.stdout):
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _run_doctor_r8(out=buf)
+    lines = [ln for ln in buf.getvalue().splitlines()
+             if not ln.startswith("DOCTOR:")]
+    cwd = os.getcwd()
+    cfg = _judge_config(cwd)
+    if cfg is None:
+        lines.append("INFO  judge - not configured (opt-in, "
+                     "escalation-only; see docs/JUDGE.md)")
+    else:
+        lines.append("PASS  judge - configured (%s, timeout %d ms); "
+                     "can only escalate, never clear"
+                     % (cfg["command"][:60], cfg["timeout_ms"]))
+    base = _skill_baseline(cwd)
+    if base is None:
+        lines.append("PASS  skills baseline - none yet (create with "
+                     "--skills-baseline)")
+    else:
+        entries, _d = _skill_drift(cwd)
+        lines.append("PASS  skills baseline - %d file(s), drift: %s"
+                     % (len(base.get("files", {})),
+                        ("%d entr(ies)" % len(entries))
+                        if entries else "none"))
+    counted = [ln for ln in lines if ln.startswith(("PASS", "FAIL"))]
+    passed = sum(1 for ln in counted if ln.startswith("PASS"))
+    lines.append("DOCTOR: %d/%d checks passed (seatbelt v%s)"
+                 % (passed, len(counted), VERSION))
+    out.write("\n".join(lines) + "\n")
+    return 0 if all(ln.startswith("PASS") for ln in counted) else 1
+
+
+run_doctor = run_doctor_r9
+
+_main_r8 = main
+
+
+def main_r9(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["--doctor"]:
+        return run_doctor_r9()
+    if argv[:1] == ["--skills"]:
+        return run_skills()
+    if argv[:1] == ["--skills-baseline"]:
+        return run_skills_baseline(accept="--accept" in argv[1:])
+    if argv[:1] == ["skills"]:
+        sub = argv[1] if len(argv) > 1 else ""
+        if sub == "baseline":
+            return run_skills_baseline(accept="--accept" in argv[2:])
+        if sub in ("", "check", "status"):
+            return run_skills()
+        sys.stderr.write("usage: seatbelt_hook.py skills "
+                         "[baseline [--accept]|check]\n")
+        return 2
+    return _main_r8(argv)
+
+
+main = main_r9
 
 
 if __name__ == "__main__":
