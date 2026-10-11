@@ -12,6 +12,8 @@ Seatbelt Bench v1   206/206 cases   ·   GuardFall fuzz 1431/1431
 Naive rm-rf regex    42/206         ·   Injection 15/15, 0 FP
 ```
 
+**Jump to:** [Install](#install-verify-then-run) · [Demo](#see-it-work) · [Features](#what-it-does) · [Agent support](#agents) · [Incidents & benchmarks](#built-from-real-disasters) · [Limits](#known-limits) · [Python library](#the-python-library) · [Docs](#docs-map)
+
 No network. No telemetry. No dependencies. The hook never phones
 home — check `tests/test_no_network.py`, it AST-scans the source.
 
