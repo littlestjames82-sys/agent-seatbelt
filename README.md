@@ -1,5 +1,9 @@
 # Agent Seatbelt
 
+[![CI](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/)
+[![License: MIT](https://img.shields.io/github/license/littlestjames82-sys/agent-seatbelt)](LICENSE)
+
 **A seatbelt for AI coding agents.** One self-contained Python file
 that reads every tool call *before* it runs — shell commands, file
 writes, MCP calls — and denies or escalates the ones that end
