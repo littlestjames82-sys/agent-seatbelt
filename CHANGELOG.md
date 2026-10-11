@@ -4,6 +4,46 @@
 
 (Disaster-feed entries land here first — see docs/FEED_RUNBOOK.md.)
 
+## 0.3.1 — 2026-10-11
+
+Hardening release (Round 10). No new features; every change closes a
+demonstrated bypass or crash. Full audit: HARDENING_031.md in the
+project workspace.
+
+- **Pipe-to-shell** now catches path-prefixed and env-wrapped shells
+  (`curl … | /bin/bash`, `curl … | env bash` — both deferred in 0.3.0).
+- **Command substitution inside double quotes** is extracted and
+  judged (the shell executes it there): `bash -c "$(curl …)"`,
+  `echo "$(cat .env)"`, `source <(curl …)`, and interpreter process
+  substitution (`python3 <(curl …)`) now deny instead of deferring.
+  Substitutions in execution position (`eval $(echo rm -rf /)`,
+  `$(echo rm) -rf /`) are judged by their payload.
+- **DNS exfiltration**: nslookup/dig join the network-tool set for
+  the secret+network deny shape.
+- **File writes via shell**: `dd of=`, `cp`/`mv`/`install`
+  destinations are gated like file-tool writes — `dd of=~/.ssh/id_rsa`
+  and `cp /dev/null ~/.ssh/id_rsa` deny.
+- **Self-protection covers the whole `.seatbelt/` state directory**
+  (flight plan, skills baseline, taint, snapshots): an agent can no
+  longer file its own flight plan or re-baseline its own drift
+  watch, via file tools or bash. Reads stay open (transparency).
+- **Secret redaction**: flag-style values (`--api-key VALUE`,
+  `--secret-access-key VALUE`), Stripe/webhook keys, JWTs, and
+  HTTP Basic credentials no longer reach the audit log.
+- **Library fail-closed fixes**: malformed agent action shapes
+  classify as consequential instead of raising; policy expressions
+  are length/token/depth capped and evaluation can no longer escape
+  as RecursionError; `matches()` rejects nested-quantifier patterns
+  and caps pattern/subject size (a 28-char subject hung 0.3.0 for
+  >25 s); policy files are size-capped at load.
+- **Permissions**: audit JSONL, governor JSONL records, snapshot
+  copies, and install.py's settings backup are created owner-only
+  (0600). Hook stdin is capped (oversized payloads deny).
+  install.py refuses non-object settings JSON instead of crashing;
+  `scripts/feed_entry.py` refuses path-traversal `--id`s.
+- New battery `tests/test_round10_hardening.py` (62 tests); bench
+  unchanged at 221/221.
+
 ## 0.3.0 — 2026-10-07
 
 The judgment release — two opt-in layers on top of the unchanged

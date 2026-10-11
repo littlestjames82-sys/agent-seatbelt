@@ -54,7 +54,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 GATED_TOOLS = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 VALID_MODES = {"enforce", "audit", "strict", "shadow"}
@@ -69,6 +69,9 @@ _TOKEN_FORMATS = [
     r"xox[baprs]-[A-Za-z0-9\-]{10,}",
     r"AKIA[0-9A-Z]{16}",
     r"AIza[A-Za-z0-9_\-]{20,}",
+    r"(?:sk|rk)_(?:live|test|prod)_[A-Za-z0-9]{10,}",
+    r"whsec_[A-Za-z0-9]{10,}",
+    r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}",
 ]
 _KV_SECRET = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
@@ -79,7 +82,13 @@ _ENV_SECRET = re.compile(
     r"\b([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Za-z0-9_]*)"
     r"=(\"[^\"]*\"|'[^']*'|[^\s;]+)"
 )
-_BEARER = re.compile(r"(?i)(authorization\s*:\s*bearer\s+)(\S+)")
+_BEARER = re.compile(r"(?i)(authorization\s*:\s*(?:bearer|basic)\s+)(\S+)")
+# Flag-style secrets: `--api-key VALUE` / `--secret-access-key VALUE`
+# (space-separated, no = or :) — the KV pattern above misses these,
+# and commands are audit-logged, so the value must not survive.
+_FLAG_SECRET = re.compile(
+    r"(?i)(--?[A-Za-z0-9_-]*(?:api[_-]?key|access[_-]?key|secret|token|"
+    r"password|passwd)[A-Za-z0-9_-]*\s+)(\"[^\"]*\"|'[^']*'|[^\s'\",;]+)")
 
 
 def _placeholder(value):
@@ -106,6 +115,10 @@ def redact(text):
     out = _KV_SECRET.sub(
         lambda m: m.group(0) if m.group(3).startswith("[redacted:")
         else m.group(1) + m.group(2) + _placeholder(m.group(3)), out
+    )
+    out = _FLAG_SECRET.sub(
+        lambda m: m.group(0) if m.group(2).startswith("[redacted:")
+        else m.group(1) + _placeholder(m.group(2)), out
     )
     for fmt in _TOKEN_FORMATS:
         out = re.sub(fmt, lambda m: _placeholder(m.group(0)), out)
@@ -182,7 +195,8 @@ _READ_VERBS = re.compile(
     r"base64|xxd|od|strings|source|export)\b"
 )
 _NETWORK_TOOLS = re.compile(
-    r"\b(curl|wget|nc|netcat|ncat|scp|sftp|ftp|http|https|httpie|aria2c)\b"
+    r"\b(curl|wget|nc|netcat|ncat|scp|sftp|ftp|http|https|httpie|aria2c|"
+    r"nslookup|dig)\b"
     r"|requests\.|urllib|socket\.|openssl\s+s_client"
 )
 
@@ -221,8 +235,14 @@ def _delete_without_where(command):
 
 
 def _pipe_to_shell(command):
+    # The shell on the far side of the pipe may be path-prefixed
+    # (/bin/bash), env-wrapped (env bash, /usr/bin/env bash), or
+    # sudo'd — all three spell the same execution.
     if re.search(
-        r"\b(curl|wget)\b[^;&\n]*\|\s*(sudo\s+)?(sh|bash|zsh|dash|ash|"
+        r"\b(curl|wget)\b[^;&\n]*\|\s*(sudo\s+)?"
+        r"(env\s+([A-Za-z_][A-Za-z0-9_]*=\S+\s+)*|/[\w./-]*/env\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)?"
+        r"(/[\w./-]*/)?(sh|bash|zsh|dash|ash|"
         r"python\d*|node|perl|ruby|php)\b",
         command,
     ):
@@ -357,7 +377,15 @@ def _overlay_rule_matches(rule, text, context):
     try:
         pattern = rule.get("pattern") or rule.get("match")
         if pattern:
-            return bool(re.search(str(pattern), text, re.I))
+            pattern = str(pattern)
+            # Overlay patterns are project-supplied: an over-long or
+            # nested-quantifier pattern is a hung hook (ReDoS), and a
+            # hung hook is one the host kills — fail closed instead.
+            if len(pattern) > 512 or re.search(
+                    r"\([^()]*[+*][^()]*\)\s*(?:[+*]|\{)", pattern):
+                raise ValueError("overlay pattern too long or "
+                                 "catastrophically nested")
+            return bool(re.search(pattern, text, re.I))
         when = rule.get("when")
         if not when or not isinstance(when, str):
             return restrictive  # unusable shape
@@ -372,6 +400,10 @@ def _overlay_rule_matches(rule, text, context):
                 return target.endswith(val)
             if fn == "contains":
                 return val in target
+            if len(val) > 512 or re.search(
+                    r"\([^()]*[+*][^()]*\)\s*(?:[+*]|\{)", val):
+                raise ValueError("overlay matches() pattern too long "
+                                 "or catastrophically nested")
             return bool(re.search(val, target))
         m = re.match(r"^([\w.]+)\s+contains\s+'([^']*)'$", w)
         if m:
@@ -914,7 +946,10 @@ def _extract_subs(text):
             out.append(c)
             i += 1
             continue
-        if q is None and ((c == "$" and text[i:i + 2] == "$(") or
+        # Substitutions execute inside double quotes too — only
+        # single quotes suppress them. (Extracting only unquoted
+        # subs hid `bash -c "$(curl …)"` and `echo "$(cat .env)"`.)
+        if q != "'" and ((c == "$" and text[i:i + 2] == "$(") or
                           (c in "<>" and text[i + 1:i + 2] == "(")):
             start = i + 2
             depth, j = 1, start
@@ -928,7 +963,7 @@ def _extract_subs(text):
             out.append(" SUBST ")
             i = j
             continue
-        if q is None and c == "`":
+        if q != "'" and c == "`":
             j = text.find("`", i + 1)
             if j == -1:
                 out.append(c)
@@ -1280,6 +1315,17 @@ def _redirect_verdict(tokens, head, idx, overlay, mode):
             targets.append(tokens[j + 1])
         if head == "tee" and j > idx and not tok.startswith("-"):
             targets.append(tok)
+    # dd's of= and cp/mv/install destinations are file writes too:
+    # without this, `dd of=~/.ssh/id_rsa` and `cp x ~/.aws/credentials`
+    # slipped past the file-write gate entirely (defer).
+    if head == "dd":
+        for tok in tokens:
+            if tok.startswith("of=") and len(tok) > 3:
+                targets.append(tok[3:])
+    if head in ("cp", "mv", "install"):
+        dests = [t for t in tokens[idx + 1:] if not t.startswith("-")]
+        if len(dests) >= 2:
+            targets.append(dests[-1])
     for target in targets:
         fv = evaluate_file("Write", target, overlay, mode)
         if fv["decision"] in ("deny", "ask"):
@@ -1493,9 +1539,31 @@ def evaluate_bash(command, overlay=None, mode="enforce", cwd=None, _depth=0):
             return _finish(bv, command, cwd)
     stripped, subs = _extract_subs(command)
     verdicts = []
+    # A substitution whose OUTPUT is executed — command position, or
+    # inside eval/exec/shell -c/source — is judged by its payload, not
+    # by the (often benign-looking) producer command: `eval $(echo
+    # rm -rf /)` and `$(echo rm) -rf /` both ran the echo's text.
+    exec_position = False
+    for _seg in _split_segments(stripped):
+        _toks = _shell_tokens(_seg)
+        if not _toks:
+            continue
+        _i = _prefix_end(_toks)
+        _head = _toks[_i] if _i < len(_toks) else ""
+        if _head == "SUBST" or _head in ("eval", "exec", "source", ".") \
+                or (_head in ("bash", "sh", "zsh", "dash", "ash")
+                    and "-c" in _toks):
+            exec_position = True
+            break
     for sub in subs:
         if _depth < 3:
             verdicts.append(evaluate_bash(sub, overlay, mode, cwd, _depth=_depth + 1))
+            if exec_position:
+                _stoks = _shell_tokens(sub)
+                if _stoks and _stoks[0] in _DATA_HEADS and len(_stoks) > 1:
+                    verdicts.append(evaluate_bash(
+                        " ".join(_stoks[1:]), overlay, mode, cwd,
+                        _depth=_depth + 1))
         else:
             verdicts.append(_decision("ask", "seatbelt-ask-nesting-too-deep",
                                       "command substitution nested too deep to verify", mode))
@@ -2490,7 +2558,13 @@ def write_audit(record, cwd):
             # The read-tail + append must be atomic across processes:
             # two agent sessions in one project would otherwise chain
             # off the same prev_hash and break the chain.
-            with open(candidate, "a+", encoding="utf-8") as fh:
+            # Audit lines carry (redacted) commands and paths — create
+            # the log owner-only (0600), not umask-default.
+            def _audit_opener(path, flags):
+                return os.open(path, flags, 0o600)
+
+            with open(candidate, "a+", encoding="utf-8",
+                      opener=_audit_opener) as fh:
                 locked = False
                 try:
                     import fcntl
@@ -2868,7 +2942,12 @@ def evaluate_file(tool_name, file_path, overlay=None, mode="enforce",
         or norm == plugin_root + "/install.py" \
         or norm.startswith(home_seat + "/") \
         or norm.endswith("/.seatbelt/policy.json") \
-        or norm.endswith("/.seatbelt/audit.jsonl")
+        or norm.endswith("/.seatbelt/audit.jsonl") \
+        or "/.seatbelt/" in norm  # whole state dir: plan.json,
+        # skills-baseline.json, taint.json, snapshots/, checkpoints —
+        # an agent that can rewrite Seatbelt's state can file its own
+        # flight plan, re-baseline its own drift watch, or clear its
+        # own taint. Writes deny; reads stay transparent (above).
     if tool_name == "Read" and (is_seatbelt_path or _GOV_ASK_PATH.search(norm)):
         candidates.append(_decision(
             "allow", "seatbelt-transparency-read",
@@ -2890,6 +2969,20 @@ def evaluate_file(tool_name, file_path, overlay=None, mode="enforce",
 
 _eval_bash_r2 = evaluate_bash
 _DESTRUCTIVE_RULE_HINTS = ("cloud", "db-", "git-", "deploy", "publish", "schema")
+
+# Bash-side twin of the file-tool self-protection: write verbs or a
+# redirect aimed at anything under a .seatbelt/ state directory.
+# (Reads — cat/ls/grep of .seatbelt files — are NOT matched: the
+# transparency stance keeps Seatbelt's state inspectable.)
+_STATE_TAMPER_RE = re.compile(
+    r"\b(?:rm|shred|truncate|mv|cp|tee|install|ln|chmod|chown|dd)\b"
+    r"[^;&\n]*\.seatbelt[/\\]"
+    r"|\bsed\b[^;&\n]*\s-(i|--in-place)\b[^;&\n]*\.seatbelt[/\\]"
+    r"|>>?\s*\S*\.seatbelt[/\\]")
+
+
+def _seatbelt_state_tamper(text):
+    return bool(_STATE_TAMPER_RE.search(text))
 
 
 def evaluate_bash(command, overlay=None, mode="enforce", cwd=None, _depth=0):
@@ -2938,17 +3031,26 @@ def evaluate_bash(command, overlay=None, mode="enforce", cwd=None, _depth=0):
                         result = _finish(_decision("deny", hit[0], hit[1], mode),
                                          str(command), cwd)
                         break
+            if result["decision"] != "deny" and _seatbelt_state_tamper(full):
+                result = _finish(_decision(
+                    "deny", "seatbelt-locked-self-protection",
+                    "this writes to Seatbelt's own state directory "
+                    "(.seatbelt/) — the policy, flight plan, baselines, "
+                    "taint and snapshots are the human's controls, not "
+                    "the agent's to rewrite", mode), str(command), cwd)
             if result["decision"] != "deny" and re.search(r"[<>]\(", str(command)) \
                     and re.search(r"\b(curl|wget)\b", " ".join(subs)) and parts:
                 head0 = parts[0][1].split()[0] if parts[0][1].split() else ""
-                if head0 in ("bash", "sh", "zsh"):
+                if head0 in ("bash", "sh", "zsh", "dash", "ash", "source", ".",
+                             "python", "python3", "python2", "node", "nodejs",
+                             "ruby", "perl", "php", "deno", "bun"):
                     result = _finish(_decision(
                         "deny", "seatbelt-locked-pipe-to-shell",
-                        "a shell is executing a process substitution fed by a download", mode),
+                        "a shell or interpreter is executing a process substitution fed by a download", mode),
                         str(command), cwd)
             if result["decision"] != "deny" and parts and subs:
                 head0 = parts[0][1].split()[0] if parts[0][1].split() else ""
-                if head0 in ("eval", "exec") and any(
+                if head0 in ("eval", "exec", "bash", "sh", "zsh", "dash") and any(
                         re.search(r"\b(curl|wget)\b", s) for s in subs):
                     result = _finish(_decision(
                         "deny", "seatbelt-locked-pipe-to-shell",
@@ -3536,7 +3638,13 @@ def take_snapshot(cwd, targets, trigger):
         stored = "files/%d" % state["idx"]
         state["idx"] += 1
         digest = hashlib.sha256()
-        with open(path, "rb") as src, open(sdir / stored, "wb") as dst:
+        # Snapshot copies duplicate file contents under .seatbelt/ —
+        # never store them more readable than owner-only.
+        def _snap_opener(p, flags):
+            return os.open(p, flags, 0o600)
+
+        with open(path, "rb") as src, open(sdir / stored, "wb",
+                                           opener=_snap_opener) as dst:
             while True:
                 chunk = src.read(1024 * 256)
                 if not chunk:
@@ -6138,10 +6246,17 @@ def _r9_skill_escalation(payload, cwd, text):
 
 _run_hook_r8 = run_hook
 
+#: Hook stdin is agent/host-shaped JSON; anything past this is a
+#: memory/parse DoS against the gate itself, not a tool call.
+MAX_HOOK_INPUT_CHARS = 4 * 1024 * 1024
+
 
 def run_hook_r9(text):
     import contextlib
     import io
+    if text and len(text) > MAX_HOOK_INPUT_CHARS:
+        return _deny("hook input exceeds the %d-char cap; failing closed"
+                     % MAX_HOOK_INPUT_CHARS)
     try:
         payload = json.loads(text) if text and text.strip() else {}
     except Exception:
@@ -6226,6 +6341,14 @@ _main_r8 = main
 
 def main_r9(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        # Hook mode: read stdin with the cap applied at read time, so
+        # an oversized payload is denied without being fully loaded.
+        raw = sys.stdin.read(MAX_HOOK_INPUT_CHARS + 1)
+        if len(raw) > MAX_HOOK_INPUT_CHARS:
+            return _deny("hook input exceeds the %d-char cap; "
+                         "failing closed" % MAX_HOOK_INPUT_CHARS)
+        return run_hook(raw)
     if argv[:1] == ["--doctor"]:
         return run_doctor_r9()
     if argv[:1] == ["--skills"]:

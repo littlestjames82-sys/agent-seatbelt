@@ -36,8 +36,13 @@ your loop's business, exactly as it was in Jev.
 """
 
 import json
+import os
 from pathlib import Path
 from urllib.parse import urlparse
+
+#: Policy documents are configuration, not data: anything larger is a
+#: mistake or an attack on the loader, not a policy.
+MAX_POLICY_BYTES = 1024 * 1024
 
 from .classify import classify_action
 from .policy import compile_policy, evaluate_policy
@@ -85,8 +90,17 @@ def load_policy(source):
         return compile_policy(source)
     path = Path(source)
     try:
-        doc = json.loads(path.read_text())
-    except (OSError, ValueError) as error:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read(MAX_POLICY_BYTES + 1)
+        if len(text) > MAX_POLICY_BYTES:
+            raise ValueError(
+                f"Seatbelt policy {str(path)!r} exceeds the {MAX_POLICY_BYTES}-byte cap; no action executed.")
+        doc = json.loads(text)
+    except ValueError as error:
+        if "exceeds the" in str(error):
+            raise
+        raise ValueError(f"Seatbelt policy {str(path)!r} could not be loaded ({error}); no action executed.") from None
+    except OSError as error:
         raise ValueError(f"Seatbelt policy {str(path)!r} could not be loaded ({error}); no action executed.") from None
     if not isinstance(doc, dict) or not isinstance(doc.get("rules"), list):
         raise ValueError(f"Seatbelt policy {str(path)!r} is not a policy document; no action executed.")
@@ -115,7 +129,12 @@ class JsonlSink:
 
     def write(self, record):
         try:
-            with open(self.path, "a", encoding="utf-8") as handle:
+            # Records carry action payloads (labels, values, URLs) —
+            # create the log owner-only (0600) instead of umask-default.
+            def _opener(path, flags):
+                return os.open(path, flags, 0o600)
+
+            with open(self.path, "a", encoding="utf-8", opener=_opener) as handle:
                 handle.write(json.dumps(record) + "\n")
                 handle.flush()
         except OSError as error:
@@ -219,10 +238,18 @@ class Governor:
         BEFORE this returns; if the sink write fails, gate() raises
         and the caller must not execute the action.
         """
+        # Agent-supplied shapes are untrusted: a non-dict action/page
+        # is gated as an unknown (consequential) action, not a crash.
+        if not isinstance(action, dict):
+            action = {}
+        if not isinstance(page, dict):
+            page = {}
         actions = page.get("actions", [])
         info = classify_action(action, actions)
         kind = f"{self.kind_prefix}.{action.get('kind')}"
         url = page.get("url", "")
+        if not isinstance(url, str):
+            url = str(url) if url is not None else ""
         payload = {
             "label": action.get("label"),
             "role": action.get("role"),

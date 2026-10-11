@@ -41,8 +41,27 @@ def classify_action(action, actions):
     read-only, WRITE_LOCAL for page-local form state (nothing has
     left the page), NETWORK_WRITE for a click that may submit data.
     """
+    # The action dict is agent-supplied (untrusted): non-dict actions,
+    # non-string kinds/roles, and non-dict companions must classify as
+    # unknown/consequential, never crash the gate.
+    if not isinstance(action, dict):
+        return {
+            "classification": CONSEQUENTIAL,
+            "permission_class": "NETWORK_WRITE",
+            "basis": "action is not an object; unknown shapes are consequential",
+        }
+    if not isinstance(actions, (list, tuple)):
+        actions = []
     kind = action.get("kind")
     role = action.get("role")
+    if not isinstance(kind, str):
+        return {
+            "classification": CONSEQUENTIAL,
+            "permission_class": "NETWORK_WRITE",
+            "basis": f"unrecognised action kind {kind!r}; unknown shapes are consequential",
+        }
+    if not isinstance(role, str):
+        role = None  # unhashable/odd roles match nothing below
     if kind in {"scroll", "wait"}:
         return {
             "classification": READ_ONLY,
@@ -61,6 +80,8 @@ def classify_action(action, actions):
         # It shares the element's node with the fill action it
         # companions.
         for other in actions:
+            if not isinstance(other, dict):
+                continue
             if (
                 other.get("kind") == "fill"
                 and other.get("node") == action.get("node")

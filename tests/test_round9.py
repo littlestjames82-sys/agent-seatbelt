@@ -418,4 +418,4 @@ def test_hook_module_has_round9_rules():
     assert hook._judge_config is not None
     assert hook._ASI_BY_RULE["seatbelt-judge"] == "ASI02"
     assert hook._ASI_BY_RULE["seatbelt-skill-drift"] == "ASI04"
-    assert hook.VERSION == "0.3.0"
+    assert hook.VERSION == "0.3.1"

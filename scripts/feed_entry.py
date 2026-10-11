@@ -18,10 +18,15 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# --id becomes a filename under feed/rules/; anything but a plain slug
+# is a path-traversal attempt (../) or a broken entry name.
+_ID_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
 
 
 def main():
@@ -33,6 +38,13 @@ def main():
     ap.add_argument("--bench-case", action="append", default=[])
     ap.add_argument("--date", default="")
     args = ap.parse_args()
+
+    if not _ID_SLUG.match(args.id or ""):
+        print("REFUSED: --id %r is not a plain slug "
+              "([a-z0-9][a-z0-9-]*, max 81 chars). The id becomes a "
+              "filename under feed/rules/; path separators and dots "
+              "are not allowed." % args.id, file=sys.stderr)
+        return 2
 
     cases_path = ROOT / "bench" / "cases.jsonl"
     known = set()

@@ -165,6 +165,11 @@ def _plant_canaries(args):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(template.replace("{TOKEN}", token)
                         .replace("{KEY}", key), encoding="utf-8")
+        try:
+            import os as _os
+            _os.chmod(path, 0o600)
+        except OSError:
+            pass
         entries.append({
             "id": cid, "path": str(path),
             "sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
@@ -206,6 +211,11 @@ def main(argv=None):
         except ValueError as exc:
             sys.stderr.write("settings file is not valid JSON: %s\n" % exc)
             return 2
+        if not isinstance(before, dict):
+            sys.stderr.write("settings file must contain a JSON object, "
+                             "got %s; refusing to rewrite it.\n"
+                             % type(before).__name__)
+            return 2
     after = merge(before, harden=args.harden, uninstall=args.uninstall)
     lines = _diff_lines(before, after)
     if args.uninstall and json.dumps(before, sort_keys=True) != json.dumps(after, sort_keys=True):
@@ -221,6 +231,13 @@ def main(argv=None):
     if path.is_file():
         backup = path.with_suffix(path.suffix + ".bak")
         backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        # The backup duplicates settings verbatim (env blocks can carry
+        # API keys) — keep it owner-only.
+        try:
+            import os as _os
+            _os.chmod(backup, 0o600)
+        except OSError:
+            pass
         print("backup written: %s" % backup)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(after, indent=2) + "\n", encoding="utf-8")
