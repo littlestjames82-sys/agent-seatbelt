@@ -1,3 +1,11 @@
+> **Status (October 14, 2026): this audit covers 0.2.0 claims.**
+> Rows that cite the 206-case bench describe the 0.2.0 corpus and
+> remain accurate for that corpus. Current-corpus figures
+> (221 cases, naive baseline 46/221) are recorded in docs/BENCH.md
+> (0.3.1 section). A refreshed claims audit against the current
+> public copy is part of the 0.3.2 release work. Nothing below has
+> been edited.
+
 # Claims audit (Round 8, Z3)
 
 Every capability sentence in the public copy (README, docs,

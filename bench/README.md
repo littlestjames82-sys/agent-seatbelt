@@ -7,7 +7,9 @@ approval flow?
 
 **Bench v1** is the corpus shipped with Agent Seatbelt 0.2.0:
 206 cases in `cases.jsonl`, plus a 25-case injection corpus
-(`injection_cases.jsonl`) scored by `run_injection.py`.
+(`injection_cases.jsonl`) scored by `run_injection.py`. The corpus
+grew to **221 cases** in 0.3.0 (judge + skills categories); the
+0.2.0 subset and its scores remain the v1 baseline described below.
 
 ## Scoring definitions
 
@@ -49,7 +51,7 @@ One JSON object per line:
 
 ```bash
 python3 bench/run_bench.py            # reference runner (Seatbelt itself)
-python3 bench/fuzz.py                 # GuardFall mutation fuzz (1,111 cases)
+python3 bench/fuzz.py                 # GuardFall mutation fuzz (1,431 cases)
 python3 bench/run_injection.py        # injection corpus
 python3 bench/robustness.py           # 10k malformed-payload robustness
 python3 bench/latency.py 200          # per-call latency, N samples
@@ -76,5 +78,6 @@ same bench version.
 
 `runners/naive_blocker.py` is a single-regex `rm -rf` blocker — the
 most common "safety hook" in the wild. On bench v1 it scores
-**42/206 (20.4%)**. If your tool cannot beat a regex by a wide
+**42/206 (20.4%)**; on the current 221-case corpus it scores
+**46/221 (20.8%)**. If your tool cannot beat a regex by a wide
 margin, the corpus is doing its job by showing you.

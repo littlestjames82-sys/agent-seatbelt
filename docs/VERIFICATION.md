@@ -1,3 +1,10 @@
+> **Status (October 14, 2026): historical — this document covers
+> 0.2.0 only.** Current-version evidence: docs/BENCH.md (0.3.1
+> section, run October 14, 2026), HARDENING_031.md (0.3.1 audit),
+> and the 0.3.0 verification record. A consolidated verification
+> document for the 0.3.2 tree is part of the 0.3.2 release work.
+> Nothing below has been edited; it stands as the 0.2.0 record.
+
 # Verification battery — Agent Seatbelt 0.2.0 (Round 8, Z5)
 
 Run on the final tree, 2026-10-07. Every item below was executed

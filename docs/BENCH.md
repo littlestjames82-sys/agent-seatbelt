@@ -1,4 +1,110 @@
-# Bench results — Agent Seatbelt 0.2.0, Seatbelt Bench v1
+# Bench results — Agent Seatbelt
+
+## 0.3.1 — run October 14, 2026 (current)
+
+All numbers in this section come from real runs on October 14, 2026
+against an isolated copy of the shipped 0.3.1 tree (109 files, no
+`.git`, caches, or `.seatbelt` state; `sha256sum -c SHA256SUMS`
+passed, 74 files; Python 3.12.3). Reproduce any of them:
+`bench/README.md` has the commands. Misses, when they exist, are
+printed by name by every runner — none are hidden here either.
+
+### Curated bench — 221/221 (100.0%), false positives 0
+
+```
+category          total   pass    score
+alias                 7      7   100.0%
+benign               39     39   100.0%
+brain                 6      6   100.0%
+canary                4      4   100.0%
+cloud-db             15     15   100.0%
+deploy                8      8   100.0%
+destructive          19     19   100.0%
+evasion              28     28   100.0%
+exfil                 5      5   100.0%
+exposure              5      5   100.0%
+file-gating           5      5   100.0%
+git                   8      8   100.0%
+judge                 8      8   100.0%
+loop                  1      1   100.0%
+mcp                   1      1   100.0%
+persistence          13     13   100.0%
+pipe-to-shell         4      4   100.0%
+plan                  8      8   100.0%
+powershell           12     12   100.0%
+script-content        7      7   100.0%
+secrets              11     11   100.0%
+skills                7      7   100.0%
+TOTAL               221    221   100.0%
+False positives (benign cases not matching): 0
+```
+
+The 221-case corpus is the 0.2.0 Bench v1 corpus (206 cases, next
+section) plus the 15 cases added in 0.3.0 (judge 8, skills 7). The
+`benign` category is the false-positive guard: 39 legitimate
+lookalikes that must NOT be blocked. It scores 39/39.
+
+### GuardFall fuzz — 1431/1431 (100.0%), 4 softened
+
+```
+GuardFall score: 1431/1431 mutations caught = 100.0%
+Softened (deny -> ask under mutation): 4
+Mutations generated: 1431 (from 113 dangerous cases)
+```
+
+"Softened" means the mutation still stopped for a human but at ask
+tier instead of deny — counted honestly, with the same disclosure
+as the 0.2.0 report.
+
+### Injection bench — 15/15 caught, 0/10 false positives
+
+```
+Positives caught (taint written): 15/15
+Benign false positives: 0/10
+INJECTION BENCH: PASS (bar: >=13/15 caught, <=1/10 FP)
+```
+
+### Selftest — 68/68
+
+```
+SELFTEST: 68/68 passed, 0 failed (seatbelt v0.3.1)
+```
+
+### Latency — subprocess end-to-end (includes Python startup)
+
+Measured October 14, 2026, 30 rounds each, sequential, sandbox VM
+(a different machine from the 0.2.0 run; compare with care):
+
+```
+allow (git status)     median  163.5 ms   p95  178.8 ms
+deny (rm -rf /)        median  165.6 ms   p95  209.2 ms
+defer (make build)     median  161.4 ms   p95  189.2 ms
+ALL                    median  163.5 ms   p95  189.2 ms
+```
+
+### Head-to-head: the naive baseline on the 221-case corpus
+
+`bench/runners/naive_blocker.py` scored through the current corpus
+(`bench/run_external.py`):
+
+```
+External runner vs Seatbelt Bench — 221 cases evaluated
+TOTAL               221     46    20.8%
+```
+
+175 misses, every one printed by name in the scorer output.
+
+### Not re-run for 0.3.1 in this pass
+
+The 10,000-payload robustness battery was not re-run for 0.3.1.
+The last full robustness run is the 0.3.0 segmented run
+(10,000/10,000 in-process, 300/300 subprocess — see
+ROBUSTNESS_FULL_RESULT.md). No number in this section should be
+read as a 0.3.1 robustness result.
+
+---
+
+## 0.2.0 — run October 7, 2026 (Bench v1 baseline, historical)
 
 All numbers on this page come from real runs of the shipped tree on
 2026-10-07. Reproduce any of them: `bench/README.md` has the
