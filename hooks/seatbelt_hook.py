@@ -331,7 +331,8 @@ def load_overlay(cwd):
     never be weakened by it: evaluation always checks locked first in
     each tier, and tiers run strictest-first across locked+overlay."""
     overlay = {"deny_patterns": [], "ask_patterns": [], "allow_patterns": [],
-               "rules": [], "broken": False, "mode_override": None, "ci": False}
+               "rules": [], "broken": False, "mode_override": None,
+               "mode_override_ignored": None, "ci": False}
     try:
         path = Path(cwd) / ".seatbelt" / "policy.json"
         if not path.is_file():
@@ -340,9 +341,23 @@ def load_overlay(cwd):
         if not isinstance(doc, dict):
             overlay["broken"] = True
             return overlay
+        # Phase 2 audit fix (2026-10-14): the project overlay may only
+        # TIGHTEN the operating mode, never loosen it. policy.json ships
+        # inside the repo, so a checked-out project setting
+        # "seatbelt_mode": "audit" would silently downgrade every locked
+        # deny to log-only for anyone who clones it. "strict" only ever
+        # escalates verdicts (ask->deny), and the shipped CI pack relies
+        # on it, so strict stays honored; audit/shadow requests are
+        # recorded in mode_override_ignored and never honored. Loosening
+        # remains the human's switch via the host env (SEATBELT_MODE),
+        # which also outranks the overlay everywhere it is resolved.
         mo = doc.get("seatbelt_mode") or doc.get("mode")
         if isinstance(mo, str) and mo.strip().lower() in VALID_MODES:
-            overlay["mode_override"] = mo.strip().lower()
+            mo = mo.strip().lower()
+            if mo == "strict":
+                overlay["mode_override"] = mo
+            else:
+                overlay["mode_override_ignored"] = mo
         overlay["ci"] = bool(doc.get("ci"))
         if isinstance(doc.get("name"), str):
             overlay["pack_name"] = doc["name"]
@@ -1280,6 +1295,247 @@ def _base64_verdict(command, mode, depth):
     return found_ask
 
 
+def _decode_escapes(s):
+    """Decode printf/ANSI-C style escapes (\\xHH, \\ooo, \\n, \\t...)."""
+    out = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            n = s[i + 1]
+            if n == "x":
+                m = re.match(r"[0-9a-fA-F]{2}", s[i + 2:i + 4])
+                if m:
+                    out.append(chr(int(m.group(0), 16)))
+                    i += 4
+                    continue
+            if n in "01234567":
+                m = re.match(r"[0-7]{1,3}", s[i + 1:i + 4])
+                if m:
+                    out.append(chr(int(m.group(0), 8)))
+                    i += 1 + len(m.group(0))
+                    continue
+            mp = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\",
+                  "'": "'", '"': '"', "a": "\a", "b": "\b",
+                  "f": "\f", "v": "\v", "e": "\x1b"}
+            if n in mp:
+                out.append(mp[n])
+                i += 2
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _decoded_forms_verdict(command, mode, depth):
+    """Phase 2 audit fix: non-base64 obfuscation layers. The base64
+    path judges decoded content; printf escapes, ANSI-C $'...' quoting,
+    rev, xxd -r and ROT13 pipelines hid the same content from every
+    detector. Only escape-encoded or transform-piped literals are
+    judged — plain data text is left alone, exactly like base64."""
+    if depth >= 3:
+        return None
+    candidates = []
+
+    def add(text):
+        if text and text != command and len(text) <= 8192 \
+                and text not in candidates:
+            candidates.append(text)
+
+    # ANSI-C quoting anywhere in the command.
+    if "$'" in command:
+        add(re.sub(r"\$'((?:[^'\\]|\\.)*)'",
+                   lambda m: _decode_escapes(m.group(1)), command))
+        for m in re.finditer(r"\$'((?:[^'\\]|\\.)*)'", command):
+            add(_decode_escapes(m.group(1)))
+    # printf format literals that use escapes (quoted on raw text,
+    # bare after normalization stripped the quotes).
+    for m in re.finditer(r"\bprintf\s+(?:-[a-zA-Z]\s+)*'([^'\n]*)'"
+                         r"|\bprintf\s+(?:-[a-zA-Z]\s+)*\"([^\"\n]*)\"",
+                         command):
+        lit = m.group(1) if m.group(1) is not None else m.group(2)
+        if "\\" in lit:
+            add(_decode_escapes(lit))
+    for m in re.finditer(r"\bprintf\s+(?:-[a-zA-Z]\s+)*(\S+)", command):
+        tok = m.group(1).strip("'\"")
+        if "\\" in tok:
+            add(_decode_escapes(tok))
+    # $(printf '...') / $(echo ...) in command position: substitute the
+    # decoded literal back into the full command and judge the result.
+    def _sub_repl(m):
+        body = m.group(1).strip()
+        mm = re.match(r"(printf|echo)\s+(?:-[a-zA-Z]+\s+)*"
+                      r"'([^'\n]*)'|"
+                      r"(printf|echo)\s+(?:-[a-zA-Z]+\s+)*"
+                      r"\"([^\"\n]*)\"", body)
+        if not mm:
+            return m.group(0)
+        lit = mm.group(2) if mm.group(2) is not None else mm.group(4)
+        head = mm.group(1) or mm.group(3)
+        return _decode_escapes(lit) if head == "printf" else lit
+    if "$(" in command:
+        add(re.sub(r"\$\(([^()]*)\)", _sub_repl, command))
+    # Transform pipelines over quoted literals — plus, for text that
+    # normalization already unquoted, the argument span of any
+    # echo/printf stage in the pipeline.
+    lits = [a or b for a, b in re.findall(r"'([^'\n]{2,})'|\"([^\"\n]{2,})\"",
+                                          command)]
+    for stage in command.split("|"):
+        words = stage.strip().split(None, 1)
+        if len(words) == 2 and words[0] in ("echo", "printf"):
+            arg = words[1].strip().strip("'\"")
+            if arg and arg not in lits:
+                lits.append(arg)
+    if re.search(r"\|\s*rev\b|\brev\s*<", command):
+        for lit in lits:
+            add(lit[::-1])
+    if re.search(r"\bxxd\b[^;&\n]*(-r|--revert)", command):
+        for lit in lits + re.findall(r"\b[0-9a-fA-F]{16,}\b", command):
+            hexs = re.sub(r"[^0-9a-fA-F]", "", lit)
+            if len(hexs) >= 8 and len(hexs) % 2 == 0:
+                try:
+                    add(bytes.fromhex(hexs).decode("utf-8"))
+                except Exception:
+                    pass
+    if re.search(r"\btr\s+['\"]?A-Za-z['\"]?\s+['\"]?N-ZA-Mn-za-m['\"]?", command):
+        import codecs
+        for lit in lits:
+            add(codecs.decode(lit, "rot13"))
+    # General tr substitution: any equal-length set pair is a cipher
+    # the classifier cannot see through, so translate the literals
+    # with the command's own mapping and judge the result (covers
+    # every ROT13 set spelling, not just the canonical one).
+    for tm in re.finditer(
+            r"\btr\s+(?:-[a-zA-Z]+\s+)*"
+            r"(?:'([^']{1,64})'|\"([^\"]{1,64})\"|(\S{1,64}))\s+"
+            r"(?:'([^']{1,64})'|\"([^\"]{1,64})\"|(\S{1,64}))", command):
+        src_set = next(g for g in tm.groups()[:3] if g is not None)
+        dst_set = next(g for g in tm.groups()[3:] if g is not None)
+
+        def _expand(s):
+            out, i = [], 0
+            while i < len(s):
+                if i + 2 < len(s) and s[i + 1] == "-" \
+                        and ord(s[i]) <= ord(s[i + 2]):
+                    out.extend(chr(o) for o in
+                               range(ord(s[i]), ord(s[i + 2]) + 1))
+                    i += 3
+                else:
+                    out.append(s[i])
+                    i += 1
+            return out
+
+        src_e, dst_e = _expand(src_set), _expand(dst_set)
+        if len(src_e) == len(dst_e) and len(src_e) >= 4:
+            table = {ord(a): b for a, b in zip(src_e, dst_e)}
+            for lit in lits:
+                add(lit.translate(table))
+    found_ask = None
+    for cand in candidates[:12]:
+        v = evaluate_bash(cand, mode=mode, _depth=depth + 1)
+        if v["decision"] == "deny":
+            return {"decision": "deny",
+                    "rule_id": "seatbelt-locked-decoded-hidden",
+                    "reason": "encoded payload decodes to a locked "
+                              "command (%s)" % v["rule_id"]}
+        if v["decision"] == "ask" and found_ask is None:
+            found_ask = {"decision": "ask",
+                         "rule_id": "seatbelt-ask-decoded-hidden",
+                         "reason": "encoded payload decodes to content "
+                                   "Seatbelt would ask about (%s)"
+                                   % v["rule_id"]}
+    return found_ask
+
+
+_HEREDOC_RE = re.compile(
+    r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?[^\n]*\n(.*?)\n[ \t]*\1[ \t]*\)?[ \t]*($|\n)",
+    re.S)
+
+
+def _heredoc_verdict(command, mode, depth):
+    """Phase 2 audit fix: heredoc bodies fed to interpreters were
+    never scanned (sh bodies surfaced as segments by luck; python /
+    node / ruby bodies sailed through). Scan the body as a script."""
+    if depth >= 3 or "<<" not in command:
+        return None
+    for m in _HEREDOC_RE.finditer(command):
+        body = m.group(2)
+        if not body.strip():
+            continue
+        sv = _script_content_verdict(body, "", mode)
+        if sv:
+            return {"decision": sv["decision"],
+                    "rule_id": "seatbelt-locked-heredoc-content:"
+                               + sv["rule_id"].split(":")[-1],
+                    "reason": "heredoc body matches %s (%s)"
+                              % (sv["rule_id"], sv["reason"])}
+    return None
+
+
+def _download_then_exec(command):
+    """Phase 2 audit fix: curl/wget saving a file that the SAME
+    command then executes — the pipe-to-shell shape with a stopover
+    on disk (the on-disk content scan cannot help: at hook time the
+    file has not been downloaded yet)."""
+    m = re.search(r"\b(?:curl|wget)\b[^;&\n]*?(?:-o|--output|-O)\s*=?\s*"
+                  r"([^\s;&|]+)", command)
+    if not m:
+        return False
+    target = m.group(1).strip("'\"")
+    rest = command[m.end():]
+    if re.search(r"\b(?:bash|sh|zsh|dash|python3?|node|ruby|perl|source|\.)"
+                 r"\s+" + re.escape(target) + r"(\s|;|&|\)|$)", rest):
+        return True
+    if re.search(r"(?:&&|\|\||;)\s*(?:\./)?" + re.escape(target) + r"(\s|;|&|\)|$)",
+                 rest):
+        return True
+    if re.search(r"\bchmod\b[^;&\n]*\+x[^;&\n]*" + re.escape(target), rest):
+        return True
+    return False
+
+
+def _dns_exfil_verdict(command, mode, extra_subs=None):
+    """Phase 2 audit fix (batch 5): a DNS lookup whose query name is
+    built by command substitution ships whatever the substitution
+    computed (a secret file's hash, the user name, the host name) to
+    whoever runs the resolver. A substitution that touches a secret
+    is deny-class exfiltration; any other substitution-fed lookup is
+    ask-class. extra_subs carries substitution bodies a caller has
+    already extracted from the command (the normalized-text pass
+    works on substitution-stripped text)."""
+    if not re.search(r"\b(host|nslookup|dig)\b", command):
+        return None
+    subs = list(extra_subs or [])
+    i = 0
+    while True:
+        j = command.find("$(", i)
+        if j < 0:
+            break
+        depth, k = 1, j + 2
+        while k < len(command) and depth:
+            if command[k] == "(":
+                depth += 1
+            elif command[k] == ")":
+                depth -= 1
+            k += 1
+        subs.append(command[j + 2:k - 1])
+        i = k
+    subs.extend(re.findall(r"`([^`\n]{1,200})`", command))
+    if not subs:
+        return None
+    if any(_secret_reference(s) for s in subs):
+        return {"decision": "deny",
+                "rule_id": "seatbelt-locked-secret-exfiltration",
+                "reason": "the DNS query is built from a secret "
+                          "file's contents or hash — that ships the "
+                          "secret to a third-party resolver"}
+    return {"decision": "ask",
+            "rule_id": "seatbelt-ask-dns-substitution",
+            "reason": "the DNS query is built by command "
+                      "substitution, so local state (user, host, "
+                      "hashes) leaves the machine in the query name"}
+
+
 _SCRIPT_EXTS = (".sh", ".bash", ".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".ps1")
 
 
@@ -1397,8 +1653,27 @@ def _eval_segment(seg, overlay, mode, cwd, depth, tokens=None):
     if head == "find":
         verdicts = []
         if "-delete" in tokens:
-            verdicts.append(_decision("ask", "seatbelt-locked-find-delete",
-                                       "find -delete removes everything the search matches", mode))
+            # Phase 2 audit fix: broad-root or unfiltered -delete is
+            # recursive deletion (rm -rf class) -> deny, not ask.
+            _root = ""
+            for _t in tokens[idx + 1:]:
+                if not _t.startswith("-"):
+                    _root = _t
+                    break
+            _filters = {"-name", "-iname", "-path", "-ipath", "-regex",
+                        "-iregex", "-type", "-newer", "-mtime", "-mmin",
+                        "-size", "-user", "-group", "-perm", "-empty"}
+            _has_filter = any(t in _filters for t in tokens)
+            _broad = _root in ("/", "~", "$HOME", "/home", "/Users")
+            if _broad or not _has_filter:
+                verdicts.append(_decision(
+                    "deny", "seatbelt-locked-find-delete-root",
+                    "find -delete from %s without a narrowing filter is "
+                    "recursive deletion by another name"
+                    % (_root or "a broad root"), mode))
+            else:
+                verdicts.append(_decision("ask", "seatbelt-locked-find-delete",
+                                           "find -delete removes everything the search matches", mode))
         if "-exec" in tokens:
             j = tokens.index("-exec")
             sub = []
@@ -1415,7 +1690,11 @@ def _eval_segment(seg, overlay, mode, cwd, depth, tokens=None):
     # S3: executing a local script that exists under cwd — read & scan it.
     if cwd and result["decision"] == "defer":
         script = None
-        if head in ("bash", "sh", "zsh", "python", "python3", "node", "ruby", "perl"):
+        if head in ("source", "."):
+            # Phase 2 audit fix: sourcing a script executes it in this
+            # shell — scan it exactly like bash <script> (was defer).
+            script = rest[0] if rest else None
+        elif head in ("bash", "sh", "zsh", "python", "python3", "node", "ruby", "perl"):
             for tok in rest:
                 if not tok.startswith("-"):
                     script = tok
@@ -1537,6 +1816,22 @@ def evaluate_bash(command, overlay=None, mode="enforce", cwd=None, _depth=0):
         bv = _base64_verdict(command, mode, _depth)
         if bv:
             return _finish(bv, command, cwd)
+        dv = _decoded_forms_verdict(command, mode, _depth)
+        if dv:
+            return _finish(dv, command, cwd)
+        hv = _heredoc_verdict(command, mode, _depth)
+        if hv:
+            return _finish(hv, command, cwd)
+        if _download_then_exec(command):
+            return _finish(_decision(
+                "deny", "seatbelt-locked-pipe-to-shell",
+                "this command downloads a file and executes it in the "
+                "same breath — the pipe-to-shell shape with a stopover "
+                "on disk; download it, review it, then run it as a "
+                "separate step", mode), command, cwd)
+        nv = _dns_exfil_verdict(command, mode)
+        if nv:
+            return _finish(nv, command, cwd)
     stripped, subs = _extract_subs(command)
     verdicts = []
     # A substitution whose OUTPUT is executed — command position, or
@@ -1873,9 +2168,21 @@ REMEDIATIONS = {
     "seatbelt-locked-secret-exfiltration": "Pass secrets via environment or a secret manager, never inside a request body or upload.",
     "seatbelt-locked-rm-rf": "List the targets first (ls), move them to a quarantine/trash directory, and delete only after checking.",
     "seatbelt-locked-fs-format": "Work on a disk image file instead of a live device, and confirm the device name twice.",
+    "seatbelt-locked-device-wipe": "Work on a disk image file instead of a live device, and confirm the device name twice.",
+    "seatbelt-locked-sysrq": "Shut down or reboot through the normal init system (systemctl reboot/poweroff) so services stop cleanly.",
+    "seatbelt-locked-find-delete-root": "List what would be deleted first (the same find without -delete), then delete a named, checked set.",
+    "seatbelt-locked-find-delete": "Run the same find without -delete first and show the matched files before deleting them.",
+    "seatbelt-locked-setuid": "Show the human the exact file and why it needs setuid/setgid before setting the bit.",
+    "seatbelt-locked-account-delete": "Disable the account first (usermod -L) and archive its home directory before any deletion.",
+    "seatbelt-locked-log-vacuum": "Archive the journal (journalctl --rotate plus a copy) before vacuuming anything.",
+    "seatbelt-locked-git-checkout-discard": "Run git status and git diff first; stash or commit anything worth keeping.",
     "seatbelt-locked-fork-bomb": "There is no safe version of this; do not run it.",
     "seatbelt-locked-git-force-push": "Use --force-with-lease, and never force-push a shared branch without telling its other users.",
     "seatbelt-locked-cloud-delete": "Tag/export the resource first, confirm account and region, and prefer a dry-run or console check.",
+    "seatbelt-locked-docker-prune": "List what the prune would remove first (docker system df / docker volume ls) and prune only the named, stopped resources.",
+    "seatbelt-locked-ps-scheduled-task-tamper": "Re-enable or re-register the task after the maintenance window; never leave security or update tasks disabled.",
+    "seatbelt-ask-ps-hidden-launch": "Launch the process visibly, or state exactly what it runs and why it needs a hidden window.",
+    "seatbelt-ask-dns-substitution": "Resolve the substitution yourself and query the literal name, or confirm the substituted value is safe to disclose to a third-party resolver.",
     "seatbelt-locked-db-drop": "Take a dump/backup first and confirm the database name out loud before dropping anything.",
     "seatbelt-locked-db-delete-nowhere": "Add a WHERE clause, run the same filter as a SELECT first, and check the row count.",
     "seatbelt-locked-secret-read": "Reference the variable name, not the value; load secrets from the environment or a secret manager.",
@@ -2032,6 +2339,12 @@ _PS_DENY = [
     ("seatbelt-locked-cmd-format",
      lambda c: bool(re.search(r"\bformat\s+[a-z]:", c)),
      "formatting a drive destroys its contents"),
+    ("seatbelt-locked-ps-disk-wipe",
+     lambda c: bool(re.search(r"\b(clear-disk|format-volume)\b", c)),
+     "Clear-Disk / Format-Volume destroys a disk's contents"),
+    ("seatbelt-locked-ps-scheduled-task-tamper",
+     lambda c: bool(re.search(r"\b(disable|unregister)-scheduledtask\b[^;&\n]*(-taskname\s+)?['\"]?[\w .\\-]*(fw|firewall|defender|security|antivirus)", c)),
+     "disabling or removing a security-related scheduled task is defense tampering"),
     ("seatbelt-locked-cmd-vssadmin",
      lambda c: bool(re.search(r"\bvssadmin\s+delete\s+shadows\b", c)),
      "deleting shadow copies removes the machine's recovery points"),
@@ -2043,6 +2356,12 @@ _PS_ASK = [
     ("seatbelt-locked-ps-encodedcommand",
      lambda c: "-encodedcommand" in c or re.search(r"\s-enc\b", c) is not None,
      "-EncodedCommand hides the real command from review"),
+    ("seatbelt-locked-ps-scheduled-task-tamper",
+     lambda c: bool(re.search(r"\b(disable|unregister)-scheduledtask\b", c)),
+     "disabling a scheduled task can silence updates, backups or security tooling; confirm which task and why"),
+    ("seatbelt-ask-ps-hidden-launch",
+     lambda c: bool(re.search(r"\bstart-process\b[^;&\n]*-windowstyle\s+(hidden|0)\b", c)),
+     "Start-Process with a hidden window launches a process the human cannot see; confirm what it runs and why it must be hidden"),
     ("seatbelt-locked-ps-iex",
      lambda c: bool(re.search(r"\b(iex|invoke-expression)\b", c)),
      "Invoke-Expression executes a string as code"),
@@ -2510,13 +2829,65 @@ LOCKED_ASK = LOCKED_ASK + [
 _CODE_DENY = _CODE_DENY + [
     ("seatbelt-locked-code-reverse-shell",
      r"socket\.socket[\s\S]{0,200}os\.dup2|os\.dup2[\s\S]{0,120}pty\.spawn|pty\.spawn[\s\S]{0,120}socket"),
+    # Phase 2 audit extensions (2026-10-14): root/home targets spelled
+    # through runtime path helpers, and the perl/ruby/R equivalents of
+    # the python destructive forms.
+    ("seatbelt-locked-code-rmtree-root",
+     r"shutil\.rmtree\(\s*(os\.path\.)?expanduser\s*\(|shutil\.rmtree\(\s*Path\.home\(\)|shutil\.rmtree\(\s*os\.environ"),
+    ("seatbelt-locked-code-rmtree-root",
+     r"(fs|fs/promises)['\"]?\)?\.(rm|rmSync)\s*\(\s*['\"](/|~|['\"])"),
+    ("seatbelt-locked-code-remove-system",
+     r"\bsystem\s*\(\s*['\"]rm['\"]\s*,\s*['\"]-rf?['\"]|remove_tree\s*\(\s*['\"]/['\"]|FileUtils\.rm_rf\s*\(\s*['\"](/|~)|File\.delete\s*\(\s*['\"]/(etc|usr|bin|sbin)/"),
 ]
 
 _eval_code_r3 = evaluate_code
 
 
+def _code_concat_collapse(code):
+    """Join adjacent string-literal concatenations ('r'+'m' -> 'rm')
+    so code detectors see the command the runtime would build."""
+    pat = re.compile(r"'([^'\n]*)'\s*\+\s*'([^'\n]*)'|"
+                     r"\"([^\"\n]*)\"\s*\+\s*\"([^\"\n]*)\"")
+    def _join(m):
+        if m.group(1) is not None:
+            return "'" + m.group(1) + m.group(2) + "'"
+        return '"' + m.group(3) + m.group(4) + '"'
+    prev = None
+    cur = code
+    for _ in range(8):
+        if cur == prev:
+            break
+        prev = cur
+        cur = pat.sub(_join, cur)
+    return cur
+
+
 def evaluate_code(code, mode="enforce", _depth=0):
     result = _eval_code_r3(code, mode, _depth)
+    # Phase 2 audit fix: string-concatenation indirection
+    # (subprocess.run(['r'+'m','-rf','/']) deferred before this).
+    try:
+        collapsed = _code_concat_collapse(code)
+        if collapsed != code:
+            alt = _eval_code_r3(collapsed, mode, _depth)
+            if _TIER_RANK[alt["decision"]] > _TIER_RANK[result["decision"]]:
+                result = alt
+            if result["decision"] in ("defer", "allow"):
+                lits = [a or b for a, b in re.findall(
+                    r"'([^'\n]*)'|\"([^\"\n]*)\"", collapsed)]
+                joined = " ".join(l for l in lits if l)
+                if joined and re.search(
+                        r"\b(rm|shred|mkfs|dd|drop|delete)\b", joined):
+                    bv = evaluate_bash(joined, mode=mode,
+                                       _depth=_depth + 1)
+                    if _TIER_RANK[bv["decision"]] > \
+                            _TIER_RANK[result["decision"]]:
+                        result = dict(
+                            bv, reason="string-concatenated code builds "
+                                       "the command %r — %s"
+                                       % (joined[:80], bv["reason"]))
+    except Exception:
+        pass
     if result["decision"] in ("defer", "allow"):
         if re.search(r"shutil\.rmtree|os\.walk|Remove-Item[^;\n]*-Recurse", code) and \
                 not re.search(r"islink|follow_symlinks\s*=\s*False|followlinks\s*=\s*False|LinkType|junction", code, re.I):
@@ -3003,12 +3374,32 @@ def evaluate_bash(command, overlay=None, mode="enforce", cwd=None, _depth=0):
             for fn, rule_id, why in (
                     (_pipe_to_shell, "seatbelt-locked-pipe-to-shell",
                      "piping a remote download straight into a shell executes unreviewed code"),
+                    (_download_then_exec, "seatbelt-locked-pipe-to-shell",
+                     "this command downloads a file and executes it in the same breath — the pipe-to-shell shape with a stopover on disk; download it, review it, then run it as a separate step"),
                     (_secret_exfil, "seatbelt-locked-secret-exfiltration",
                      "the command touches a secret AND a network tool in one step — that is the exfiltration shape")):
                 if fn(full) and _TIER_RANK[result["decision"]] < 3:
                     result = _finish(_decision("deny", rule_id, why, mode),
                                      str(command), cwd)
                     break
+            # Phase 2: the decoded-forms verdict also runs on the
+            # NORMALIZED full text — mutation layers ($IFS insertion,
+            # quote fragmentation, $VAR command names, subshell wraps)
+            # are undone by normalization, and the raw-text pass inside
+            # evaluate_bash cannot see through them.
+            if result["decision"] != "deny" and _depth < 3:
+                dv = _decoded_forms_verdict(full, mode, _depth)
+                if dv and _TIER_RANK[dv["decision"]] > \
+                        _TIER_RANK[result["decision"]]:
+                    result = _finish(dv, str(command), cwd)
+            # Same reasoning for the DNS-substitution verdict: a
+            # quote-fragmented tool name (h"o"st) defeats the raw-text
+            # pass but not the normalized one.
+            if result["decision"] != "deny":
+                nv = _dns_exfil_verdict(full, mode, extra_subs=subs)
+                if nv and _TIER_RANK[nv["decision"]] > \
+                        _TIER_RANK[result["decision"]]:
+                    result = _finish(nv, str(command), cwd)
             if result["decision"] != "deny":
                 # Redirect-inclusive shapes (reverse shells write to
                 # /dev/tcp via a redirect the segment pass splits
@@ -4476,6 +4867,38 @@ def evaluate_file(tool_name, file_path, overlay=None, mode="enforce",
                   content=None, cwd=None):
     result = _eval_file_r3(tool_name, file_path, overlay, mode,
                            content=content, cwd=cwd)
+    # Phase 2 audit fix (2026-10-14): /proc/sysrq-trigger is a kernel
+    # command channel, not a file — any write to it fires an immediate
+    # kernel action (reboot/poweroff). Deny outright for write tools;
+    # shell redirects land here too via _redirect_verdict.
+    if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        _p = str(file_path or "").replace("\\", "/")
+        if _p.endswith("/proc/sysrq-trigger") or "/proc/sysrq-" in _p:
+            return _add_remed({
+                "decision": "deny",
+                "rule_id": "seatbelt-locked-sysrq",
+                "reason": "writing to /proc/sysrq-trigger triggers an "
+                          "immediate kernel action (reboot, poweroff, "
+                          "sync) with no userspace cleanup"})
+    # Phase 2 audit fix (2026-10-14): cron spool and system scheduler
+    # locations are persistence writes. Bash-side crontab edits were
+    # already gated, but a Write/Edit straight into the spool deferred.
+    if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit") \
+            and result["decision"] in ("defer", "allow"):
+        _norm = os.path.realpath(os.path.expanduser(
+            str(file_path or ""))).replace("\\", "/")
+        if re.search(r"/var/spool/cron/|/etc/crontab$|/etc/cron\."
+                     r"(d|daily|hourly|weekly|monthly)/"
+                     r"|/etc/systemd/system/[^/]+\.service$"
+                     r"|/Library/(LaunchAgents|LaunchDaemons)/"
+                     r"|/\.config/systemd/user/[^/]+\.service$", _norm):
+            return _add_remed({
+                "decision": "ask",
+                "rule_id": "seatbelt-locked-persistence-write",
+                "reason": "this writes directly into a scheduler/"
+                          "persistence location (%s) — scheduled tasks "
+                          "outlive the session and run unattended"
+                          % _norm})
     if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         resolved = os.path.realpath(os.path.expanduser(str(file_path or "")))
         norm = resolved.replace("\\", "/")
@@ -4513,6 +4936,77 @@ LOCKED_ASK = LOCKED_ASK + [
     ("seatbelt-locked-cloud-delete",
      lambda c: bool(re.search(r"\brailway\s+volume\s+delete\b|\bdeleteVolume\b", c)),
      "this deletes a hosted volume/database through a cloud API shape"),
+]
+
+def _find_delete_root(c):
+    """Phase 2 helper: find -delete is deny-class when it starts at a
+    filesystem/home root (any filters) or has NO narrowing filter at
+    all (an unfiltered tree wipe from any root). A filtered find in a
+    subdirectory stays ask-class (incident-cowork-photos-find)."""
+    m = re.search(r"\bfind\s+(\S+)[^;&\n]*\s-delete\b", c)
+    if not m:
+        return False
+    if m.group(1) in ("/", "~", "$HOME", "/home", "/Users"):
+        return True
+    filters = ("-name", "-iname", "-path", "-ipath", "-regex",
+               "-iregex", "-type", "-newer", "-mtime", "-mmin",
+               "-size", "-user", "-group", "-perm", "-empty")
+    seg_tokens = c[m.start():].split()
+    return not any(f in seg_tokens for f in filters)
+
+
+# ── Phase 2 audit extensions (2026-10-14) ────────────────────────────
+# Fresh mutation families from the 0.3.2 adversarial probing pass that
+# the shipped corpus did not cover. Each rule ships with bench cases
+# (destructive + benign near-miss) in bench/cases.jsonl.
+LOCKED_DENY = LOCKED_DENY + [
+    ("seatbelt-locked-device-wipe",
+     lambda c: bool(re.search(r"\bwipefs\b|\bblkdiscard\b|\bnvme\s+format\b|\bsgdisk\b[^;&\n]*(--zap|--clear)|\bhdparm\b[^;&\n]*--security-erase", c)),
+     "wiping a device's signatures or blocks destroys its contents as surely as formatting it"),
+    ("seatbelt-locked-sysrq",
+     lambda c: bool(re.search(r"([<>]|tee|dd|echo|printf|cp|mv|install)\b[^;&\n]*sysrq-trigger|sysrq-trigger[^;&\n]*(>|of=)", c)),
+     "writing to /proc/sysrq-trigger triggers immediate kernel actions (reboot, poweroff, sync) with no userspace cleanup"),
+    ("seatbelt-locked-find-delete-root",
+     lambda c: _find_delete_root(c),
+     "find -delete from a broad root (or any root, unfiltered) is recursive deletion by another name"),
+    ("seatbelt-locked-code-rmtree-root",
+     lambda c: bool(re.search(r"\bunlink\s*\(\s*['\"]/['\"]\s*,\s*recursive\s*=\s*(TRUE|T|True)", c)),
+     "recursive unlink of the filesystem root destroys the machine's contents"),
+    ("seatbelt-locked-cloud-delete",
+     lambda c: bool(re.search(r"\bkubectl\s+delete\s+[\w/.-]+\s+--all\b|\bkubectl\s+delete\b[^;&\n]*--all-namespaces", c)),
+     "deleting every resource of a type, or across all namespaces, wipes a cluster's workloads at once"),
+    ("seatbelt-locked-secret-exfiltration",
+     lambda c: bool(re.search(r"\b(rsync|rclone)\b[^;&\n]*(\.env\b|id_rsa|id_ed25519|\.aws[/\\]|\.ssh[/\\]|credentials)", c)) and bool(re.search(r"[\w.-]+@[\w.-]+:|[\w.-]+:|\bremote:", c)),
+     "a sync tool sending a secret file to a remote destination is the exfiltration shape"),
+    ("seatbelt-locked-secret-exfiltration",
+     lambda c: bool(re.search(r"(\.env|id_rsa|id_ed25519|\.aws[/\\]credentials|\.netrc)[^;&\n]*/dev/tcp/|/dev/tcp/[^;&\n]*(\.env|id_rsa|credentials)", c)),
+     "a secret file moving over a raw /dev/tcp socket is the exfiltration shape"),
+]
+LOCKED_ASK = LOCKED_ASK + [
+    ("seatbelt-locked-find-delete",
+     lambda c: bool(re.search(r"\bfind\b[^;&\n]*\s-delete\b", c)),
+     "find -delete removes every matched file without a trash step"),
+    ("seatbelt-locked-setuid",
+     lambda c: bool(re.search(r"\bchmod\b[^;&\n]*(\bu\+s\b|\ba\+s\b|\+s[a-z]*\b|\b[2-7][0-7]{3}\b)", c)),
+     "setting setuid/setgid bits can hand out privilege escalation; a human should confirm the target"),
+    ("seatbelt-locked-account-delete",
+     lambda c: bool(re.search(r"\b(userdel|groupdel)\b", c)),
+     "deleting a user or group (userdel -r also removes the home directory) is hard to undo"),
+    ("seatbelt-locked-log-vacuum",
+     lambda c: bool(re.search(r"\bjournalctl\b[^;&\n]*--vacuum", c)),
+     "vacuuming the journal destroys system logs, including the record of what happened on this machine"),
+    ("seatbelt-locked-git-checkout-discard",
+     lambda c: bool(re.search(r"\bgit\s+checkout\s+(--\s+)?\.(\s|$)", c)),
+     "git checkout . discards every uncommitted change in the tree"),
+    ("seatbelt-locked-cloud-delete",
+     lambda c: bool(re.search(r"\bkubectl\s+delete\b", c)),
+     "kubectl delete removes live workloads or their data; a name alone cannot prove it is safe"),
+    ("seatbelt-locked-docker-prune",
+     lambda c: bool(re.search(r"\bdocker\s+(system\s+)?prune\b[^;&\n]*--volumes|\bdocker\s+volume\s+(prune|rm)\b|\bdocker\s+system\s+prune\b[^;&\n]*(\s-a\b|--all\b)|\bdocker[ -]compose\s+down\b[^;&\n]*(\s-v\b|--volumes\b)", c)),
+     "pruning with volumes (or removing volumes) destroys container data that is not in any image"),
+    ("seatbelt-locked-cmd-bcdedit",
+     lambda c: bool(re.search(r"\bbcdedit\b", c)),
+     "bcdedit changes boot configuration"),
 ]
 
 # X2: Flight Plan.
@@ -5179,6 +5673,56 @@ def run_hook(raw):
         import io
         agent = _agent_for(payload, event)
         session_id = payload.get("session_id") or payload.get("sessionId") or ""
+        # Phase 2 audit fix (2026-10-14): envelope shape gate. Valid
+        # JSON with wrong-shaped fields used to be silently deferred
+        # (fail-open): tool_input as a bare string, a non-string
+        # command, or a missing/unknown tool_name carrying a command
+        # all slipped past classification while unparseable input
+        # already failed closed. Canonicalize near-miss tool names so
+        # the command still gets classified, and fail closed on shapes
+        # no real host sends.
+        _gated = {"bash": "Bash", "powershell": "PowerShell",
+                  "write": "Write", "edit": "Edit",
+                  "multiedit": "MultiEdit", "notebookedit": "NotebookEdit",
+                  "read": "Read"}
+        _raw_input = None
+        for _k in ("tool_input", "input", "toolInput"):
+            if _k in payload:
+                _raw_input = payload.get(_k)
+                break
+        _shape_fail = None
+        if _raw_input is not None and not isinstance(_raw_input, dict):
+            _shape_fail = "tool_input is not an object"
+        elif not str(tool_name).strip():
+            _shape_fail = "tool_name is missing"
+        elif isinstance(_raw_input, dict) and "command" in _raw_input \
+                and not isinstance(_raw_input.get("command"), str):
+            _shape_fail = "tool_input.command is not a string"
+        if _shape_fail:
+            try:
+                write_audit({"ts": _now(), "event": event,
+                             "session_id": session_id, "cwd": cwd,
+                             "mode": "enforce", "version": VERSION,
+                             "agent": agent, "tool_name": str(tool_name),
+                             "decision": "deny",
+                             "rule_id": "seatbelt-hook-fail-closed",
+                             "reason": _shape_fail}, cwd)
+            except Exception:
+                pass
+            return _deny_envelope(
+                agent, "Seatbelt could not parse this tool call "
+                "(%s); failing closed" % _shape_fail)
+        _canon = _gated.get(str(tool_name).strip().lower())
+        if _canon and _canon != tool_name:
+            payload["tool_name"] = _canon
+            tool_name = _canon
+            raw = json.dumps(payload)
+        elif _canon is None and not tool_name.startswith("mcp__") \
+                and isinstance(_raw_input, dict) \
+                and isinstance(_raw_input.get("command"), str):
+            payload["tool_name"] = "Bash"
+            tool_name = "Bash"
+            raw = json.dumps(payload)
         is_mcp = tool_name.startswith("mcp__")
         mcp_server = ""
         if is_mcp:

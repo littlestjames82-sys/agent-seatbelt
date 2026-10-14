@@ -27,6 +27,9 @@ Repository = "https://github.com/littlestjames82-sys/agent-seatbelt"
 Issues = "https://github.com/littlestjames82-sys/agent-seatbelt/issues"
 Changelog = "https://github.com/littlestjames82-sys/agent-seatbelt/releases"
 
+[tool.hatch.build]
+exclude = [".seatbelt"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_seatbelt"]
 
