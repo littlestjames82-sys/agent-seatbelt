@@ -1,6 +1,117 @@
 # Bench results — Agent Seatbelt
 
-## 0.3.1 — run October 14, 2026 (current)
+## Post-0.3.1 tree (0.3.2 candidate) — run October 14, 2026 (current)
+
+All numbers in this section come from real runs on October 14, 2026
+against an isolated copy of repository main at commit 6b5d84a (the
+0.3.1 release plus the Phase 2 audit remediation), verified
+file-for-file against the remote (118 files, blob hashes matched;
+Python 3.12.3). This tree has not been tagged or released; version
+strings still read 0.3.1. The audit behind the new cases is
+docs/SECURITY_AUDIT_0.3.2.md; the consolidated verification record
+is docs/VERIFICATION_0.3.2.md.
+
+### Curated bench — 272/272 (100.0%), false positives 0
+
+```
+category          total   pass    score
+alias                 7      7   100.0%
+anti-forensics        1      1   100.0%
+benign               51     51   100.0%
+brain                 6      6   100.0%
+canary                4      4   100.0%
+cloud-db             15     15   100.0%
+cloud-delete          2      2   100.0%
+deploy                8      8   100.0%
+destructive          33     33   100.0%
+evasion              28     28   100.0%
+exfil                 5      5   100.0%
+exfiltration          2      2   100.0%
+exposure              5      5   100.0%
+file-gating           5      5   100.0%
+git                   8      8   100.0%
+git-destructive       1      1   100.0%
+interpreter           6      6   100.0%
+judge                 8      8   100.0%
+loop                  1      1   100.0%
+mcp                   1      1   100.0%
+obfuscation           5      5   100.0%
+permissions           1      1   100.0%
+persistence          14     14   100.0%
+pipe-to-shell         5      5   100.0%
+plan                  8      8   100.0%
+powershell           15     15   100.0%
+script-content        8      8   100.0%
+secrets              11     11   100.0%
+skills                7      7   100.0%
+system-control        1      1   100.0%
+TOTAL               272    272   100.0%
+False positives (benign cases not matching): 0
+```
+
+The 272-case corpus is the 221-case 0.3.1 corpus (next section)
+plus 51 cases added by the Phase 2 audit, every fix shipping with
+a benign near-miss. The benign category is the false-positive
+guard: 51 legitimate lookalikes that must NOT be blocked. It
+scores 51/51.
+
+### GuardFall fuzz — 1853/1853 (100.0%), 4 softened
+
+```
+GuardFall score: 1853/1853 mutations caught = 100.0%
+Softened (deny -> ask under mutation): 4
+Mutations generated: 1853 (from 146 dangerous cases)
+```
+
+### Injection bench — 15/15 caught, 0/10 false positives
+
+```
+Positives caught (taint written): 15/15
+Benign false positives: 0/10
+INJECTION BENCH: PASS (bar: >=13/15 caught, <=1/10 FP)
+```
+
+### Selftest — 68/68
+
+```
+SELFTEST: 68/68 passed, 0 failed (seatbelt v0.3.1)
+```
+
+### Latency — subprocess end-to-end (includes Python startup)
+
+Measured October 14, 2026, 25 rounds each, sequential, quiet
+sandbox VM:
+
+```
+allow (git status)     median  179.3 ms   p95  200.0 ms
+deny (rm -rf /)        median  171.4 ms   p95  204.4 ms
+defer (make build)     median  176.1 ms   p95  224.1 ms
+ALL                    median  174.3 ms   p95  204.4 ms
+```
+
+Slightly above the 0.3.1 figure (163.5 ms) — the Phase 2
+decoded-forms and DNS-substitution passes cost measurable time,
+recorded here rather than rounded away.
+
+### Head-to-head: the naive baseline on the 272-case corpus
+
+```
+External runner vs Seatbelt Bench — 272 cases evaluated
+TOTAL               272     56    20.6%
+```
+
+216 misses, every one printed by name in the scorer output.
+
+### Robustness
+
+10,000 of 10,000 in-process payloads, 0 failures, and 300 of 300
+subprocess samples, 0 failures, on this candidate tree
+(bench/robustness_segmented.py; run completed October 15, 2026).
+Verdict: PASS. Full record: docs/VERIFICATION_0.3.2.md, section 10.
+
+---
+
+## 0.3.1 — run October 14, 2026
 
 All numbers in this section come from real runs on October 14, 2026
 against an isolated copy of the shipped 0.3.1 tree (109 files, no

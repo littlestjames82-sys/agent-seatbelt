@@ -1,10 +1,32 @@
-> **Status (October 14, 2026): this audit covers 0.2.0 claims.**
-> Rows that cite the 206-case bench describe the 0.2.0 corpus and
-> remain accurate for that corpus. Current-corpus figures
-> (221 cases, naive baseline 46/221) are recorded in docs/BENCH.md
-> (0.3.1 section). A refreshed claims audit against the current
-> public copy is part of the 0.3.2 release work. Nothing below has
-> been edited.
+> **Status (October 14, 2026): the refresh below audits the
+> current public copy and the 0.3.2 candidate tree.** The original
+> audit (0.2.0 claims) follows it, unedited, as history.
+
+# Claims audit refresh — October 14, 2026
+
+Scope: README headline and capability copy, docs/BENCH.md,
+docs/SECURITY_AUDIT_0.3.2.md, docs/VERIFICATION_0.3.2.md, the
+GitHub repo description, and the Pages site. Evidence runs are
+the October 14, 2026 isolated-tree verification
+(docs/VERIFICATION_0.3.2.md) and the Phase 2 audit.
+
+| # | Claim (where) | Evidence | Verdict |
+|---|---|---|---|
+| R1 | "Seatbelt Bench (0.3.1) 221/221 · GuardFall fuzz 1431/1431 · Naive 46/221 · Injection 15/15, 0 FP" (README banner, repo description, Pages site) | Phase 1 re-run on the isolated 0.3.1 tree, October 14, 2026: 221/221, fuzz 1431/1431 with 4 softened, naive 46/221, injection PASS | kept — describes the released 0.3.1 exactly |
+| R2 | Candidate-tree figures: bench 272/272, fuzz 1853/1853, naive 56/272 (BENCH.md top section, VERIFICATION_0.3.2.md, SECURITY_AUDIT_0.3.2.md) | Executed October 14, 2026 on the isolated 6b5d84a tree (118/118 blobs verified) | kept — labelled candidate tree everywhere it appears; the README banner does NOT carry these numbers until 0.3.2 is actually released |
+| R3 | "379 tests" (VERIFICATION_0.3.2.md) | Full pytest on the isolated tree: 379 passed (363 at 0.3.1 + 16 Phase 2 tests) | kept |
+| R4 | "Robustness 10,000/10,000 + 300/300" (SECURITY_AUDIT_0.3.2.md, VERIFICATION_0.3.2.md) | Segmented battery, October 14, 2026; the audit's run covers the shipped 0.3.1 code, the verification run covers the candidate tree | kept, with the per-tree scoping stated in both documents |
+| R5 | "Hash-chained audit log detects tampering" (README) | Phase 2 integrity exercise: mid-log verdict flip detected at the altered line; silent TAIL truncation is NOT detectable — copy that implies more than tamper-evident is wrong | kept as tamper-evident only; the limit is stated in SECURITY_AUDIT_0.3.2.md and the threat model |
+| R6 | "One self-contained Python file, stdlib only" (README) | Standalone copy in an empty directory: selftest 68/68, live deny; wheel declares zero Requires-Dist | kept |
+| R7 | Per-agent support rows (README, docs/AGENTS.md) | Simulated-payload batteries only; no host was live-tested in this cycle | kept with the simulated-tested label; no row was upgraded |
+| R8 | Snapshot caps "2,000 files / 256 MB / 64 MB per file" (README, SNAPSHOTS.md) | Unchanged code path; cap tests in the 379 | kept |
+| R9 | Latency "~163 ms median" (0.3.1 BENCH section) | Candidate tree measures 174.3 ms median, same method; the 0.3.1 figure stays attached to the 0.3.1 section | kept, dated per section; no blended figure anywhere |
+| R10 | "First / only / sandbox" style claims (anywhere) | Sweep of README, docs, site copy for this refresh | removed (class) — none present; Seatbelt is described as a policy gate, not a sandbox, in every current surface |
+
+Process note: this refresh exists because the 0.2.0 audit's
+numbers kept presenting as current after two releases. The rule
+it establishes: a number may headline only the tree it was
+measured on, and every headline carries its version.
 
 # Claims audit (Round 8, Z3)
 
