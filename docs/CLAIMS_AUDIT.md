@@ -1,6 +1,10 @@
 > **Status (October 14, 2026): the refresh below audits the
 > current public copy and the 0.3.2 candidate tree.** The original
 > audit (0.2.0 claims) follows it, unedited, as history.
+>
+> **Update (October 17, 2026): the candidate tree was released as
+> v0.3.2. "Candidate tree" below refers to its pre-release state;
+> the README banner now carries the 0.3.2 figures, per row R2.**
 
 # Claims audit refresh — October 14, 2026
 

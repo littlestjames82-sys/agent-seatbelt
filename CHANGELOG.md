@@ -4,6 +4,41 @@
 
 (Disaster-feed entries land here first — see docs/FEED_RUNBOOK.md.)
 
+## 0.3.2 — 2026-10-17
+
+Proof release (the 0.3.2 audit cycle). No new features. An external
+review asked what the shipped artifact could prove, so 0.3.2 is the
+0.3.1 tree put through a release-specific security audit, with every
+public number reconciled to a measured run. Full record:
+docs/SECURITY_AUDIT_0.3.2.md and docs/VERIFICATION_0.3.2.md.
+
+- **Adversarial probing**: 232 fresh payloads written against the
+  0.3.1 tree found 42 real bypasses. All 42 are fixed and
+  replay-closed: a project policy overlay can no longer loosen the
+  mode, malformed hook envelopes fail closed, destructive peers
+  (wipefs, blkdiscard, sysrq, find -delete, setuid chmod, userdel,
+  journal vacuum, git checkout discard, cron and systemd
+  persistence writes) are covered, decoder pipelines (printf
+  escapes, ANSI-C quoting, rev, xxd -r, tr ciphers) are judged on
+  their output, interpreter destructive forms and heredoc bodies
+  are scanned, source/. script content is scanned,
+  download-then-execute is caught, and DNS substitution exfil,
+  /dev/tcp secret exfil, rsync/rclone secret sources, kubectl and
+  docker prune tiers, and PowerShell disk tampering are gated.
+- **Bench**: the curated corpus grew from 221 to 272 cases;
+  272/272, false positives 0. GuardFall mutation fuzz 1853/1853.
+  A naive rm-rf regex baseline scores 56/272 (20.6%) on the same
+  corpus. Injection bench 15/15 caught, 0/10 false positives.
+- **Robustness battery**: 10,000/10,000 in-process payloads and
+  300/300 subprocess payloads handled, 0 failures (segmented run,
+  completed October 15, 2026).
+- **Tests**: 379 passed (363 at 0.3.1 plus 16 audit-cycle tests).
+- **Audit log**: described precisely as tamper-evident, not
+  tamper-proof; silent tail truncation is not detectable, and the
+  docs now say so wherever the log is described.
+- **Supply chain**: the sdist no longer ships .seatbelt state
+  files.
+
 ## 0.3.1 — 2026-10-11
 
 Hardening release (Round 10). No new features; every change closes a

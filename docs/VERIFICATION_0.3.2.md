@@ -1,4 +1,4 @@
-# Verification — Agent Seatbelt, 0.3.2 candidate tree
+# Verification — Agent Seatbelt, 0.3.2
 
 Run October 14, 2026, against an isolated copy of repository main
 at commit 6b5d84a105785a51b627439611e26c3b4f071ebf (the 0.3.1
@@ -10,10 +10,10 @@ no `.git`, caches, or `.seatbelt` state inside it. Interpreter:
 Python 3.12.3. Every item below was executed against that copy.
 Anything that failed is named, with what was done about it.
 
-Version strings in this tree still read 0.3.1 (pyproject, library
-`__init__`, hook VERSION). This document verifies the tree proposed
-to carry the 0.3.2 tag; the version bump, tag, and PyPI release are
-separate steps and have not happened yet.
+At verification time this tree's version strings still read 0.3.1
+(pyproject, library `__init__`, hook VERSION). The tree was then
+bumped to 0.3.2 and released as v0.3.2 on October 17, 2026; the
+bump changed version strings and release framing only, no code.
 
 ## 1. Full pytest suite
 

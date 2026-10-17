@@ -5,15 +5,16 @@ copied exactly from this release's real bench output (docs/BENCH.md).
 
 ## Why (the 30-second version)
 
-- Seatbelt Bench (0.3.1): **221/221 cases (100.0%)**, false positives 0.
+- Seatbelt Bench (0.3.2): **272/272 cases (100.0%)**, false positives 0.
 - A naive single-regex `rm -rf` blocker — the thing most teams
-  actually have — scores **46/221 (20.8%)** on the same corpus.
-- GuardFall mutation fuzz: **1431/1431 mutations caught (100.0%)**,
+  actually have — scores **56/272 (20.6%)** on the same corpus.
+- GuardFall mutation fuzz: **1853/1853 mutations caught (100.0%)**,
   4 softened (deny→ask).
 - Injection bench: **15/15 positives caught, 0/10 false positives**.
 - Robustness: **10,000/10,000** malformed payloads handled without a
-  crash, failing closed (full run on 0.3.0, segmented; a 0.3.x re-run
-  is tracked work, see docs/BENCH.md).
+  crash, failing closed, plus **300/300** subprocess samples
+  (segmented battery on the 0.3.2 tree, completed October 15, 2026;
+  full record in docs/VERIFICATION_0.3.2.md).
 
 ## Step 1 — pilot (one repo, one week)
 

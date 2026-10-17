@@ -8,8 +8,8 @@ agent-bypass launches, memory poisoning. Every verdict names its
 rule, its blast radius, and the safer path.
 
 ```text
-Seatbelt Bench (0.3.1)   221/221 cases   ·   GuardFall fuzz 1431/1431
-Naive rm-rf regex    46/221         ·   Injection 15/15, 0 FP
+Seatbelt Bench (0.3.2)   272/272 cases   ·   GuardFall fuzz 1853/1853
+Naive rm-rf regex    56/272         ·   Injection 15/15, 0 FP
 ```
 
 No network. No telemetry. No dependencies. The hook never phones
@@ -161,7 +161,7 @@ separately-credentialed service does on its own.
 ## How it compares (honestly)
 
 - **Single-regex rm blockers** are the common baseline; the bench
-  scores one at 20.8% on the current 221-case corpus. They're
+  scores one at 20.6% on the current 272-case corpus. They're
   better than nothing and blind to everything else.
 - **Shellter** covers PowerShell/cmd and persistence well; Seatbelt
   matches that ground and adds deobfuscation, snapshots, and the

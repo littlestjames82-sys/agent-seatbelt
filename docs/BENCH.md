@@ -1,13 +1,14 @@
 # Bench results — Agent Seatbelt
 
-## Post-0.3.1 tree (0.3.2 candidate) — run October 14, 2026 (current)
+## 0.3.2 — run October 14, 2026 (current)
 
 All numbers in this section come from real runs on October 14, 2026
 against an isolated copy of repository main at commit 6b5d84a (the
 0.3.1 release plus the Phase 2 audit remediation), verified
 file-for-file against the remote (118 files, blob hashes matched;
-Python 3.12.3). This tree has not been tagged or released; version
-strings still read 0.3.1. The audit behind the new cases is
+Python 3.12.3). At measurement time this tree's version strings
+still read 0.3.1; it was released as v0.3.2 on October 17, 2026.
+The audit behind the new cases is
 docs/SECURITY_AUDIT_0.3.2.md; the consolidated verification record
 is docs/VERIFICATION_0.3.2.md.
 
@@ -105,7 +106,7 @@ TOTAL               272     56    20.6%
 ### Robustness
 
 10,000 of 10,000 in-process payloads, 0 failures, and 300 of 300
-subprocess samples, 0 failures, on this candidate tree
+subprocess samples, 0 failures, on this tree
 (bench/robustness_segmented.py; run completed October 15, 2026).
 Verdict: PASS. Full record: docs/VERIFICATION_0.3.2.md, section 10.
 
