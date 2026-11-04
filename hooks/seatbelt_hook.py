@@ -51,7 +51,7 @@ import re
 import shlex
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 VERSION = "0.3.2"
@@ -3961,6 +3961,43 @@ def _enumerate_snapshot_targets(payload, kind, cwd):
     return out[:500]
 
 
+def _mint_snapshot_id(base, ts):
+    """Mint a snapshot id of the form <ts>-<uuid6> that sorts after
+    every snapshot id already stored for the same second.
+
+    Snapshot consumers (_prune_snapshots, run_snapshots) order by
+    directory name, so name order has to be creation order. A purely
+    random suffix breaks that within one second: two snapshots taken
+    in the same second sort by their random suffixes, and the
+    "newest" pick becomes a coin flip (this is what made
+    test_restore_reverts_edit_and_is_undoable fail on fast runners).
+    When the random suffix would not sort after the largest suffix
+    already present for this second, it is bumped to one past it.
+    The hex space cannot realistically exhaust (16M snapshots in one
+    second); if it ever did, the prefix rolls to the next second."""
+    prefix = ts.strftime("%Y%m%dT%H%M%S") + "-"
+    while True:
+        suffix = uuid.uuid4().hex[:6]
+        try:
+            existing = [d.name[len(prefix):] for d in base.iterdir()
+                        if d.is_dir() and d.name.startswith(prefix)
+                        and len(d.name) == len(prefix) + 6
+                        and all(ch in "0123456789abcdef"
+                                for ch in d.name[len(prefix):])]
+        except OSError:
+            existing = []
+        if existing:
+            top = max(existing)
+            if suffix <= top:
+                if int(top, 16) < 0xFFFFFF:
+                    suffix = "%06x" % (int(top, 16) + 1)
+                else:
+                    ts = ts + timedelta(seconds=1)
+                    prefix = ts.strftime("%Y%m%dT%H%M%S") + "-"
+                    continue
+        return prefix + suffix
+
+
 def take_snapshot(cwd, targets, trigger):
     """Copy the current state of `targets` into
     .seatbelt/snapshots/<ts>-<id>/ with a sha256 manifest. Links are
@@ -3969,8 +4006,19 @@ def take_snapshot(cwd, targets, trigger):
     base = _snap_root(cwd)
     base.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc)
-    sid = ts.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
-    sdir = base / sid
+    # Claim the snapshot directory atomically: two hooks minting in
+    # the same second for the same project re-mint on collision
+    # instead of merging into one directory.
+    for _attempt in range(100):
+        sid = _mint_snapshot_id(base, ts)
+        sdir = base / sid
+        try:
+            sdir.mkdir(parents=True, exist_ok=False)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise RuntimeError("could not mint a unique snapshot id")
     (sdir / "files").mkdir(parents=True, exist_ok=True)
     manifest = {"id": sid, "ts": ts.isoformat(), "trigger": redact(str(trigger))[:160],
                 "files": [], "skipped_too_large": [], "skipped_missing": [],

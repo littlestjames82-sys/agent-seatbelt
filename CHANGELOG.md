@@ -4,6 +4,17 @@
 
 (Disaster-feed entries land here first — see docs/FEED_RUNBOOK.md.)
 
+- **Snapshot ids now sort in creation order.** Snapshot consumers
+  (pruning, `--snapshots`) order by directory name, but ids were a
+  second-resolution timestamp plus a random suffix, so two snapshots
+  taken within the same second sorted randomly and the "newest"
+  pick was a coin flip — the cause of the recurring
+  test_restore_reverts_edit_and_is_undoable failures on fast CI
+  runners. The minter now bumps the suffix past the largest one
+  already stored for that second, and claims the snapshot directory
+  atomically so two hooks minting at once cannot collide. Id format
+  is unchanged.
+
 ## 0.3.2 — 2026-10-17
 
 Proof release (the 0.3.2 audit cycle). No new features. An external
