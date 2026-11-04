@@ -34,7 +34,7 @@ exclude = [".seatbelt"]
 packages = ["src/agent_seatbelt"]
 
 [dependency-groups]
-dev = ["pytest>=8.4,<9"]
+dev = ["pytest>=8.4,<10"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
