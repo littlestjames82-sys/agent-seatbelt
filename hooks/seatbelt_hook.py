@@ -51,10 +51,10 @@ import re
 import shlex
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.2"
 GATED_TOOLS = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 VALID_MODES = {"enforce", "audit", "strict", "shadow"}
@@ -69,6 +69,9 @@ _TOKEN_FORMATS = [
     r"xox[baprs]-[A-Za-z0-9\-]{10,}",
     r"AKIA[0-9A-Z]{16}",
     r"AIza[A-Za-z0-9_\-]{20,}",
+    r"(?:sk|rk)_(?:live|test|prod)_[A-Za-z0-9]{10,}",
+    r"whsec_[A-Za-z0-9]{10,}",
+    r"eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}",
 ]
 _KV_SECRET = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
@@ -79,7 +82,13 @@ _ENV_SECRET = re.compile(
     r"\b([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Za-z0-9_]*)"
     r"=(\"[^\"]*\"|'[^']*'|[^\s;]+)"
 )
-_BEARER = re.compile(r"(?i)(authorization\s*:\s*bearer\s+)(\S+)")
+_BEARER = re.compile(r"(?i)(authorization\s*:\s*(?:bearer|basic)\s+)(\S+)")
+# Flag-style secrets: `--api-key VALUE` / `--secret-access-key VALUE`
+# (space-separated, no = or :) — the KV pattern above misses these,
+# and commands are audit-logged, so the value must not survive.
+_FLAG_SECRET = re.compile(
+    r"(?i)(--?[A-Za-z0-9_-]*(?:api[_-]?key|access[_-]?key|secret|token|"
+    r"password|passwd)[A-Za-z0-9_-]*\s+)(\"[^\"]*\"|'[^']*'|[^\s'\",;]+)")
 
 
 def _placeholder(value):
@@ -106,6 +115,10 @@ def redact(text):
     out = _KV_SECRET.sub(
         lambda m: m.group(0) if m.group(3).startswith("[redacted:")
         else m.group(1) + m.group(2) + _placeholder(m.group(3)), out
+    )
+    out = _FLAG_SECRET.sub(
+        lambda m: m.group(0) if m.group(2).startswith("[redacted:")
+        else m.group(1) + _placeholder(m.group(2)), out
     )
     for fmt in _TOKEN_FORMATS:
         out = re.sub(fmt, lambda m: _placeholder(m.group(0)), out)
@@ -182,7 +195,8 @@ _READ_VERBS = re.compile(
     r"base64|xxd|od|strings|source|export)\b"
 )
 _NETWORK_TOOLS = re.compile(
-    r"\b(curl|wget|nc|netcat|ncat|scp|sftp|ftp|http|https|httpie|aria2c)\b"
+    r"\b(curl|wget|nc|netcat|ncat|scp|sftp|ftp|http|https|httpie|aria2c|"
+    r"nslookup|dig)\b"
     r"|requests\.|urllib|socket\.|openssl\s+s_client"
 )
 
@@ -221,8 +235,14 @@ def _delete_without_where(command):
 
 
 def _pipe_to_shell(command):
+    # The shell on the far side of the pipe may be path-prefixed
+    # (/bin/bash), env-wrapped (env bash, /usr/bin/env bash), or
+    # sudo'd — all three spell the same execution.
     if re.search(
-        r"\b(curl|wget)\b[^;&\n]*\|\s*(sudo\s+)?(sh|bash|zsh|dash|ash|"
+        r"\b(curl|wget)\b[^;&\n]*\|\s*(sudo\s+)?"
+        r"(env\s+([A-Za-z_][A-Za-z0-9_]*=\S+\s+)*|/[\w./-]*/env\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*=\S+\s+)*)?"
+        r"(/[\w./-]*/)?(sh|bash|zsh|dash|ash|"
         r"python\d*|node|perl|ruby|php)\b",
         command,
     ):
@@ -311,7 +331,8 @@ def load_overlay(cwd):
     never be weakened by it: evaluation always checks locked first in
     each tier, and tiers run strictest-first across locked+overlay."""
     overlay = {"deny_patterns": [], "ask_patterns": [], "allow_patterns": [],
-               "rules": [], "broken": False, "mode_override": None, "ci": False}
+               "rules": [], "broken": False, "mode_override": None,
+               "mode_override_ignored": None, "ci": False}
     try:
         path = Path(cwd) / ".seatbelt" / "policy.json"
         if not path.is_file():
@@ -320,9 +341,23 @@ def load_overlay(cwd):
         if not isinstance(doc, dict):
             overlay["broken"] = True
             return overlay
+        # Phase 2 audit fix (2026-10-14): the project overlay may only
+        # TIGHTEN the operating mode, never loosen it. policy.json ships
+        # inside the repo, so a checked-out project setting
+        # "seatbelt_mode": "audit" would silently downgrade every locked
+        # deny to log-only for anyone who clones it. "strict" only ever
+        # escalates verdicts (ask->deny), and the shipped CI pack relies
+        # on it, so strict stays honored; audit/shadow requests are
+        # recorded in mode_override_ignored and never honored. Loosening
+        # remains the human's switch via the host env (SEATBELT_MODE),
+        # which also outranks the overlay everywhere it is resolved.
         mo = doc.get("seatbelt_mode") or doc.get("mode")
         if isinstance(mo, str) and mo.strip().lower() in VALID_MODES:
-            overlay["mode_override"] = mo.strip().lower()
+            mo = mo.strip().lower()
+            if mo == "strict":
+                overlay["mode_override"] = mo
+            else:
+                overlay["mode_override_ignored"] = mo
         overlay["ci"] = bool(doc.get("ci"))
         if isinstance(doc.get("name"), str):
             overlay["pack_name"] = doc["name"]
@@ -357,7 +392,15 @@ def _overlay_rule_matches(rule, text, context):
     try:
         pattern = rule.get("pattern") or rule.get("match")
         if pattern:
-            return bool(re.search(str(pattern), text, re.I))
+            pattern = str(pattern)
+            # Overlay patterns are project-supplied: an over-long or
+            # nested-quantifier pattern is a hung hook (ReDoS), and a
+            # hung hook is one the host kills — fail closed instead.
+            if len(pattern) > 512 or re.search(
+                    r"\([^()]*[+*][^()]*\)\s*(?:[+*]|\{)", pattern):
+                raise ValueError("overlay pattern too long or "
+                                 "catastrophically nested")
+            return bool(re.search(pattern, text, re.I))
         when = rule.get("when")
         if not when or not isinstance(when, str):
             return restrictive  # unusable shape
@@ -372,6 +415,10 @@ def _overlay_rule_matches(rule, text, context):
                 return target.endswith(val)
             if fn == "contains":
                 return val in target
+            if len(val) > 512 or re.search(
+                    r"\([^()]*[+*][^()]*\)\s*(?:[+*]|\{)", val):
+                raise ValueError("overlay matches() pattern too long "
+                                 "or catastrophically nested")
             return bool(re.search(val, target))
         m = re.match(r"^([\w.]+)\s+contains\s+'([^']*)'$", w)
         if m:
@@ -914,7 +961,10 @@ def _extract_subs(text):
             out.append(c)
             i += 1
             continue
-        if q is None and ((c == "$" and text[i:i + 2] == "$(") or
+        # Substitutions execute inside double quotes too — only
+        # single quotes suppress them. (Extracting only unquoted
+        # subs hid `bash -c "$(curl …)"` and `echo "$(cat .env)"`.)
+        if q != "'" and ((c == "$" and text[i:i + 2] == "$(") or
                           (c in "<>" and text[i + 1:i + 2] == "(")):
             start = i + 2
             depth, j = 1, start
@@ -928,7 +978,7 @@ def _extract_subs(text):
             out.append(" SUBST ")
             i = j
             continue
-        if q is None and c == "`":
+        if q != "'" and c == "`":
             j = text.find("`", i + 1)
             if j == -1:
                 out.append(c)
@@ -1245,6 +1295,247 @@ def _base64_verdict(command, mode, depth):
     return found_ask
 
 
+def _decode_escapes(s):
+    """Decode printf/ANSI-C style escapes (\\xHH, \\ooo, \\n, \\t...)."""
+    out = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            n = s[i + 1]
+            if n == "x":
+                m = re.match(r"[0-9a-fA-F]{2}", s[i + 2:i + 4])
+                if m:
+                    out.append(chr(int(m.group(0), 16)))
+                    i += 4
+                    continue
+            if n in "01234567":
+                m = re.match(r"[0-7]{1,3}", s[i + 1:i + 4])
+                if m:
+                    out.append(chr(int(m.group(0), 8)))
+                    i += 1 + len(m.group(0))
+                    continue
+            mp = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\",
+                  "'": "'", '"': '"', "a": "\a", "b": "\b",
+                  "f": "\f", "v": "\v", "e": "\x1b"}
+            if n in mp:
+                out.append(mp[n])
+                i += 2
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _decoded_forms_verdict(command, mode, depth):
+    """Phase 2 audit fix: non-base64 obfuscation layers. The base64
+    path judges decoded content; printf escapes, ANSI-C $'...' quoting,
+    rev, xxd -r and ROT13 pipelines hid the same content from every
+    detector. Only escape-encoded or transform-piped literals are
+    judged — plain data text is left alone, exactly like base64."""
+    if depth >= 3:
+        return None
+    candidates = []
+
+    def add(text):
+        if text and text != command and len(text) <= 8192 \
+                and text not in candidates:
+            candidates.append(text)
+
+    # ANSI-C quoting anywhere in the command.
+    if "$'" in command:
+        add(re.sub(r"\$'((?:[^'\\]|\\.)*)'",
+                   lambda m: _decode_escapes(m.group(1)), command))
+        for m in re.finditer(r"\$'((?:[^'\\]|\\.)*)'", command):
+            add(_decode_escapes(m.group(1)))
+    # printf format literals that use escapes (quoted on raw text,
+    # bare after normalization stripped the quotes).
+    for m in re.finditer(r"\bprintf\s+(?:-[a-zA-Z]\s+)*'([^'\n]*)'"
+                         r"|\bprintf\s+(?:-[a-zA-Z]\s+)*\"([^\"\n]*)\"",
+                         command):
+        lit = m.group(1) if m.group(1) is not None else m.group(2)
+        if "\\" in lit:
+            add(_decode_escapes(lit))
+    for m in re.finditer(r"\bprintf\s+(?:-[a-zA-Z]\s+)*(\S+)", command):
+        tok = m.group(1).strip("'\"")
+        if "\\" in tok:
+            add(_decode_escapes(tok))
+    # $(printf '...') / $(echo ...) in command position: substitute the
+    # decoded literal back into the full command and judge the result.
+    def _sub_repl(m):
+        body = m.group(1).strip()
+        mm = re.match(r"(printf|echo)\s+(?:-[a-zA-Z]+\s+)*"
+                      r"'([^'\n]*)'|"
+                      r"(printf|echo)\s+(?:-[a-zA-Z]+\s+)*"
+                      r"\"([^\"\n]*)\"", body)
+        if not mm:
+            return m.group(0)
+        lit = mm.group(2) if mm.group(2) is not None else mm.group(4)
+        head = mm.group(1) or mm.group(3)
+        return _decode_escapes(lit) if head == "printf" else lit
+    if "$(" in command:
+        add(re.sub(r"\$\(([^()]*)\)", _sub_repl, command))
+    # Transform pipelines over quoted literals — plus, for text that
+    # normalization already unquoted, the argument span of any
+    # echo/printf stage in the pipeline.
+    lits = [a or b for a, b in re.findall(r"'([^'\n]{2,})'|\"([^\"\n]{2,})\"",
+                                          command)]
+    for stage in command.split("|"):
+        words = stage.strip().split(None, 1)
+        if len(words) == 2 and words[0] in ("echo", "printf"):
+            arg = words[1].strip().strip("'\"")
+            if arg and arg not in lits:
+                lits.append(arg)
+    if re.search(r"\|\s*rev\b|\brev\s*<", command):
+        for lit in lits:
+            add(lit[::-1])
+    if re.search(r"\bxxd\b[^;&\n]*(-r|--revert)", command):
+        for lit in lits + re.findall(r"\b[0-9a-fA-F]{16,}\b", command):
+            hexs = re.sub(r"[^0-9a-fA-F]", "", lit)
+            if len(hexs) >= 8 and len(hexs) % 2 == 0:
+                try:
+                    add(bytes.fromhex(hexs).decode("utf-8"))
+                except Exception:
+                    pass
+    if re.search(r"\btr\s+['\"]?A-Za-z['\"]?\s+['\"]?N-ZA-Mn-za-m['\"]?", command):
+        import codecs
+        for lit in lits:
+            add(codecs.decode(lit, "rot13"))
+    # General tr substitution: any equal-length set pair is a cipher
+    # the classifier cannot see through, so translate the literals
+    # with the command's own mapping and judge the result (covers
+    # every ROT13 set spelling, not just the canonical one).
+    for tm in re.finditer(
+            r"\btr\s+(?:-[a-zA-Z]+\s+)*"
+            r"(?:'([^']{1,64})'|\"([^\"]{1,64})\"|(\S{1,64}))\s+"
+            r"(?:'([^']{1,64})'|\"([^\"]{1,64})\"|(\S{1,64}))", command):
+        src_set = next(g for g in tm.groups()[:3] if g is not None)
+        dst_set = next(g for g in tm.groups()[3:] if g is not None)
+
+        def _expand(s):
+            out, i = [], 0
+            while i < len(s):
+                if i + 2 < len(s) and s[i + 1] == "-" \
+                        and ord(s[i]) <= ord(s[i + 2]):
+                    out.extend(chr(o) for o in
+                               range(ord(s[i]), ord(s[i + 2]) + 1))
+                    i += 3
+                else:
+                    out.append(s[i])
+                    i += 1
+            return out
+
+        src_e, dst_e = _expand(src_set), _expand(dst_set)
+        if len(src_e) == len(dst_e) and len(src_e) >= 4:
+            table = {ord(a): b for a, b in zip(src_e, dst_e)}
+            for lit in lits:
+                add(lit.translate(table))
+    found_ask = None
+    for cand in candidates[:12]:
+        v = evaluate_bash(cand, mode=mode, _depth=depth + 1)
+        if v["decision"] == "deny":
+            return {"decision": "deny",
+                    "rule_id": "seatbelt-locked-decoded-hidden",
+                    "reason": "encoded payload decodes to a locked "
+                              "command (%s)" % v["rule_id"]}
+        if v["decision"] == "ask" and found_ask is None:
+            found_ask = {"decision": "ask",
+                         "rule_id": "seatbelt-ask-decoded-hidden",
+                         "reason": "encoded payload decodes to content "
+                                   "Seatbelt would ask about (%s)"
+                                   % v["rule_id"]}
+    return found_ask
+
+
+_HEREDOC_RE = re.compile(
+    r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?[^\n]*\n(.*?)\n[ \t]*\1[ \t]*\)?[ \t]*($|\n)",
+    re.S)
+
+
+def _heredoc_verdict(command, mode, depth):
+    """Phase 2 audit fix: heredoc bodies fed to interpreters were
+    never scanned (sh bodies surfaced as segments by luck; python /
+    node / ruby bodies sailed through). Scan the body as a script."""
+    if depth >= 3 or "<<" not in command:
+        return None
+    for m in _HEREDOC_RE.finditer(command):
+        body = m.group(2)
+        if not body.strip():
+            continue
+        sv = _script_content_verdict(body, "", mode)
+        if sv:
+            return {"decision": sv["decision"],
+                    "rule_id": "seatbelt-locked-heredoc-content:"
+                               + sv["rule_id"].split(":")[-1],
+                    "reason": "heredoc body matches %s (%s)"
+                              % (sv["rule_id"], sv["reason"])}
+    return None
+
+
+def _download_then_exec(command):
+    """Phase 2 audit fix: curl/wget saving a file that the SAME
+    command then executes — the pipe-to-shell shape with a stopover
+    on disk (the on-disk content scan cannot help: at hook time the
+    file has not been downloaded yet)."""
+    m = re.search(r"\b(?:curl|wget)\b[^;&\n]*?(?:-o|--output|-O)\s*=?\s*"
+                  r"([^\s;&|]+)", command)
+    if not m:
+        return False
+    target = m.group(1).strip("'\"")
+    rest = command[m.end():]
+    if re.search(r"\b(?:bash|sh|zsh|dash|python3?|node|ruby|perl|source|\.)"
+                 r"\s+" + re.escape(target) + r"(\s|;|&|\)|$)", rest):
+        return True
+    if re.search(r"(?:&&|\|\||;)\s*(?:\./)?" + re.escape(target) + r"(\s|;|&|\)|$)",
+                 rest):
+        return True
+    if re.search(r"\bchmod\b[^;&\n]*\+x[^;&\n]*" + re.escape(target), rest):
+        return True
+    return False
+
+
+def _dns_exfil_verdict(command, mode, extra_subs=None):
+    """Phase 2 audit fix (batch 5): a DNS lookup whose query name is
+    built by command substitution ships whatever the substitution
+    computed (a secret file's hash, the user name, the host name) to
+    whoever runs the resolver. A substitution that touches a secret
+    is deny-class exfiltration; any other substitution-fed lookup is
+    ask-class. extra_subs carries substitution bodies a caller has
+    already extracted from the command (the normalized-text pass
+    works on substitution-stripped text)."""
+    if not re.search(r"\b(host|nslookup|dig)\b", command):
+        return None
+    subs = list(extra_subs or [])
+    i = 0
+    while True:
+        j = command.find("$(", i)
+        if j < 0:
+            break
+        depth, k = 1, j + 2
+        while k < len(command) and depth:
+            if command[k] == "(":
+                depth += 1
+            elif command[k] == ")":
+                depth -= 1
+            k += 1
+        subs.append(command[j + 2:k - 1])
+        i = k
+    subs.extend(re.findall(r"`([^`\n]{1,200})`", command))
+    if not subs:
+        return None
+    if any(_secret_reference(s) for s in subs):
+        return {"decision": "deny",
+                "rule_id": "seatbelt-locked-secret-exfiltration",
+                "reason": "the DNS query is built from a secret "
+                          "file's contents or hash — that ships the "
+                          "secret to a third-party resolver"}
+    return {"decision": "ask",
+            "rule_id": "seatbelt-ask-dns-substitution",
+            "reason": "the DNS query is built by command "
+                      "substitution, so local state (user, host, "
+                      "hashes) leaves the machine in the query name"}
+
+
 _SCRIPT_EXTS = (".sh", ".bash", ".py", ".js", ".mjs", ".cjs", ".rb", ".pl", ".ps1")
 
 
@@ -1280,6 +1571,17 @@ def _redirect_verdict(tokens, head, idx, overlay, mode):
             targets.append(tokens[j + 1])
         if head == "tee" and j > idx and not tok.startswith("-"):
             targets.append(tok)
+    # dd's of= and cp/mv/install destinations are file writes too:
+    # without this, `dd of=~/.ssh/id_rsa` and `cp x ~/.aws/credentials`
+    # slipped past the file-write gate entirely (defer).
+    if head == "dd":
+        for tok in tokens:
+            if tok.startswith("of=") and len(tok) > 3:
+                targets.append(tok[3:])
+    if head in ("cp", "mv", "install"):
+        dests = [t for t in tokens[idx + 1:] if not t.startswith("-")]
+        if len(dests) >= 2:
+            targets.append(dests[-1])
     for target in targets:
         fv = evaluate_file("Write", target, overlay, mode)
         if fv["decision"] in ("deny", "ask"):
@@ -1351,8 +1653,27 @@ def _eval_segment(seg, overlay, mode, cwd, depth, tokens=None):
     if head == "find":
         verdicts = []
         if "-delete" in tokens:
-            verdicts.append(_decision("ask", "seatbelt-locked-find-delete",
-                                       "find -delete removes everything the search matches", mode))
+            # Phase 2 audit fix: broad-root or unfiltered -delete is
+            # recursive deletion (rm -rf class) -> deny, not ask.
+            _root = ""
+            for _t in tokens[idx + 1:]:
+                if not _t.startswith("-"):
+                    _root = _t
+                    break
+            _filters = {"-name", "-iname", "-path", "-ipath", "-regex",
+                        "-iregex", "-type", "-newer", "-mtime", "-mmin",
+                        "-size", "-user", "-group", "-perm", "-empty"}
+            _has_filter = any(t in _filters for t in tokens)
+            _broad = _root in ("/", "~", "$HOME", "/home", "/Users")
+            if _broad or not _has_filter:
+                verdicts.append(_decision(
+                    "deny", "seatbelt-locked-find-delete-root",
+                    "find -delete from %s without a narrowing filter is "
+                    "recursive deletion by another name"
+                    % (_root or "a broad root"), mode))
+            else:
+                verdicts.append(_decision("ask", "seatbelt-locked-find-delete",
+                                           "find -delete removes everything the search matches", mode))
         if "-exec" in tokens:
             j = tokens.index("-exec")
             sub = []
@@ -1369,7 +1690,11 @@ def _eval_segment(seg, overlay, mode, cwd, depth, tokens=None):
     # S3: executing a local script that exists under cwd — read & scan it.
     if cwd and result["decision"] == "defer":
         script = None
-        if head in ("bash", "sh", "zsh", "python", "python3", "node", "ruby", "perl"):
+        if head in ("source", "."):
+            # Phase 2 audit fix: sourcing a script executes it in this
+            # shell — scan it exactly like bash <script> (was defer).
+            script = rest[0] if rest else None
+        elif head in ("bash", "sh", "zsh", "python", "python3", "node", "ruby", "perl"):
             for tok in rest:
                 if not tok.startswith("-"):
                     script = tok
@@ -1491,11 +1816,49 @@ def evaluate_bash(command, overlay=None, mode="enforce", cwd=None, _depth=0):
         bv = _base64_verdict(command, mode, _depth)
         if bv:
             return _finish(bv, command, cwd)
+        dv = _decoded_forms_verdict(command, mode, _depth)
+        if dv:
+            return _finish(dv, command, cwd)
+        hv = _heredoc_verdict(command, mode, _depth)
+        if hv:
+            return _finish(hv, command, cwd)
+        if _download_then_exec(command):
+            return _finish(_decision(
+                "deny", "seatbelt-locked-pipe-to-shell",
+                "this command downloads a file and executes it in the "
+                "same breath — the pipe-to-shell shape with a stopover "
+                "on disk; download it, review it, then run it as a "
+                "separate step", mode), command, cwd)
+        nv = _dns_exfil_verdict(command, mode)
+        if nv:
+            return _finish(nv, command, cwd)
     stripped, subs = _extract_subs(command)
     verdicts = []
+    # A substitution whose OUTPUT is executed — command position, or
+    # inside eval/exec/shell -c/source — is judged by its payload, not
+    # by the (often benign-looking) producer command: `eval $(echo
+    # rm -rf /)` and `$(echo rm) -rf /` both ran the echo's text.
+    exec_position = False
+    for _seg in _split_segments(stripped):
+        _toks = _shell_tokens(_seg)
+        if not _toks:
+            continue
+        _i = _prefix_end(_toks)
+        _head = _toks[_i] if _i < len(_toks) else ""
+        if _head == "SUBST" or _head in ("eval", "exec", "source", ".") \
+                or (_head in ("bash", "sh", "zsh", "dash", "ash")
+                    and "-c" in _toks):
+            exec_position = True
+            break
     for sub in subs:
         if _depth < 3:
             verdicts.append(evaluate_bash(sub, overlay, mode, cwd, _depth=_depth + 1))
+            if exec_position:
+                _stoks = _shell_tokens(sub)
+                if _stoks and _stoks[0] in _DATA_HEADS and len(_stoks) > 1:
+                    verdicts.append(evaluate_bash(
+                        " ".join(_stoks[1:]), overlay, mode, cwd,
+                        _depth=_depth + 1))
         else:
             verdicts.append(_decision("ask", "seatbelt-ask-nesting-too-deep",
                                       "command substitution nested too deep to verify", mode))
@@ -1805,9 +2168,21 @@ REMEDIATIONS = {
     "seatbelt-locked-secret-exfiltration": "Pass secrets via environment or a secret manager, never inside a request body or upload.",
     "seatbelt-locked-rm-rf": "List the targets first (ls), move them to a quarantine/trash directory, and delete only after checking.",
     "seatbelt-locked-fs-format": "Work on a disk image file instead of a live device, and confirm the device name twice.",
+    "seatbelt-locked-device-wipe": "Work on a disk image file instead of a live device, and confirm the device name twice.",
+    "seatbelt-locked-sysrq": "Shut down or reboot through the normal init system (systemctl reboot/poweroff) so services stop cleanly.",
+    "seatbelt-locked-find-delete-root": "List what would be deleted first (the same find without -delete), then delete a named, checked set.",
+    "seatbelt-locked-find-delete": "Run the same find without -delete first and show the matched files before deleting them.",
+    "seatbelt-locked-setuid": "Show the human the exact file and why it needs setuid/setgid before setting the bit.",
+    "seatbelt-locked-account-delete": "Disable the account first (usermod -L) and archive its home directory before any deletion.",
+    "seatbelt-locked-log-vacuum": "Archive the journal (journalctl --rotate plus a copy) before vacuuming anything.",
+    "seatbelt-locked-git-checkout-discard": "Run git status and git diff first; stash or commit anything worth keeping.",
     "seatbelt-locked-fork-bomb": "There is no safe version of this; do not run it.",
     "seatbelt-locked-git-force-push": "Use --force-with-lease, and never force-push a shared branch without telling its other users.",
     "seatbelt-locked-cloud-delete": "Tag/export the resource first, confirm account and region, and prefer a dry-run or console check.",
+    "seatbelt-locked-docker-prune": "List what the prune would remove first (docker system df / docker volume ls) and prune only the named, stopped resources.",
+    "seatbelt-locked-ps-scheduled-task-tamper": "Re-enable or re-register the task after the maintenance window; never leave security or update tasks disabled.",
+    "seatbelt-ask-ps-hidden-launch": "Launch the process visibly, or state exactly what it runs and why it needs a hidden window.",
+    "seatbelt-ask-dns-substitution": "Resolve the substitution yourself and query the literal name, or confirm the substituted value is safe to disclose to a third-party resolver.",
     "seatbelt-locked-db-drop": "Take a dump/backup first and confirm the database name out loud before dropping anything.",
     "seatbelt-locked-db-delete-nowhere": "Add a WHERE clause, run the same filter as a SELECT first, and check the row count.",
     "seatbelt-locked-secret-read": "Reference the variable name, not the value; load secrets from the environment or a secret manager.",
@@ -1964,6 +2339,12 @@ _PS_DENY = [
     ("seatbelt-locked-cmd-format",
      lambda c: bool(re.search(r"\bformat\s+[a-z]:", c)),
      "formatting a drive destroys its contents"),
+    ("seatbelt-locked-ps-disk-wipe",
+     lambda c: bool(re.search(r"\b(clear-disk|format-volume)\b", c)),
+     "Clear-Disk / Format-Volume destroys a disk's contents"),
+    ("seatbelt-locked-ps-scheduled-task-tamper",
+     lambda c: bool(re.search(r"\b(disable|unregister)-scheduledtask\b[^;&\n]*(-taskname\s+)?['\"]?[\w .\\-]*(fw|firewall|defender|security|antivirus)", c)),
+     "disabling or removing a security-related scheduled task is defense tampering"),
     ("seatbelt-locked-cmd-vssadmin",
      lambda c: bool(re.search(r"\bvssadmin\s+delete\s+shadows\b", c)),
      "deleting shadow copies removes the machine's recovery points"),
@@ -1975,6 +2356,12 @@ _PS_ASK = [
     ("seatbelt-locked-ps-encodedcommand",
      lambda c: "-encodedcommand" in c or re.search(r"\s-enc\b", c) is not None,
      "-EncodedCommand hides the real command from review"),
+    ("seatbelt-locked-ps-scheduled-task-tamper",
+     lambda c: bool(re.search(r"\b(disable|unregister)-scheduledtask\b", c)),
+     "disabling a scheduled task can silence updates, backups or security tooling; confirm which task and why"),
+    ("seatbelt-ask-ps-hidden-launch",
+     lambda c: bool(re.search(r"\bstart-process\b[^;&\n]*-windowstyle\s+(hidden|0)\b", c)),
+     "Start-Process with a hidden window launches a process the human cannot see; confirm what it runs and why it must be hidden"),
     ("seatbelt-locked-ps-iex",
      lambda c: bool(re.search(r"\b(iex|invoke-expression)\b", c)),
      "Invoke-Expression executes a string as code"),
@@ -2442,13 +2829,65 @@ LOCKED_ASK = LOCKED_ASK + [
 _CODE_DENY = _CODE_DENY + [
     ("seatbelt-locked-code-reverse-shell",
      r"socket\.socket[\s\S]{0,200}os\.dup2|os\.dup2[\s\S]{0,120}pty\.spawn|pty\.spawn[\s\S]{0,120}socket"),
+    # Phase 2 audit extensions (2026-10-14): root/home targets spelled
+    # through runtime path helpers, and the perl/ruby/R equivalents of
+    # the python destructive forms.
+    ("seatbelt-locked-code-rmtree-root",
+     r"shutil\.rmtree\(\s*(os\.path\.)?expanduser\s*\(|shutil\.rmtree\(\s*Path\.home\(\)|shutil\.rmtree\(\s*os\.environ"),
+    ("seatbelt-locked-code-rmtree-root",
+     r"(fs|fs/promises)['\"]?\)?\.(rm|rmSync)\s*\(\s*['\"](/|~|['\"])"),
+    ("seatbelt-locked-code-remove-system",
+     r"\bsystem\s*\(\s*['\"]rm['\"]\s*,\s*['\"]-rf?['\"]|remove_tree\s*\(\s*['\"]/['\"]|FileUtils\.rm_rf\s*\(\s*['\"](/|~)|File\.delete\s*\(\s*['\"]/(etc|usr|bin|sbin)/"),
 ]
 
 _eval_code_r3 = evaluate_code
 
 
+def _code_concat_collapse(code):
+    """Join adjacent string-literal concatenations ('r'+'m' -> 'rm')
+    so code detectors see the command the runtime would build."""
+    pat = re.compile(r"'([^'\n]*)'\s*\+\s*'([^'\n]*)'|"
+                     r"\"([^\"\n]*)\"\s*\+\s*\"([^\"\n]*)\"")
+    def _join(m):
+        if m.group(1) is not None:
+            return "'" + m.group(1) + m.group(2) + "'"
+        return '"' + m.group(3) + m.group(4) + '"'
+    prev = None
+    cur = code
+    for _ in range(8):
+        if cur == prev:
+            break
+        prev = cur
+        cur = pat.sub(_join, cur)
+    return cur
+
+
 def evaluate_code(code, mode="enforce", _depth=0):
     result = _eval_code_r3(code, mode, _depth)
+    # Phase 2 audit fix: string-concatenation indirection
+    # (subprocess.run(['r'+'m','-rf','/']) deferred before this).
+    try:
+        collapsed = _code_concat_collapse(code)
+        if collapsed != code:
+            alt = _eval_code_r3(collapsed, mode, _depth)
+            if _TIER_RANK[alt["decision"]] > _TIER_RANK[result["decision"]]:
+                result = alt
+            if result["decision"] in ("defer", "allow"):
+                lits = [a or b for a, b in re.findall(
+                    r"'([^'\n]*)'|\"([^\"\n]*)\"", collapsed)]
+                joined = " ".join(l for l in lits if l)
+                if joined and re.search(
+                        r"\b(rm|shred|mkfs|dd|drop|delete)\b", joined):
+                    bv = evaluate_bash(joined, mode=mode,
+                                       _depth=_depth + 1)
+                    if _TIER_RANK[bv["decision"]] > \
+                            _TIER_RANK[result["decision"]]:
+                        result = dict(
+                            bv, reason="string-concatenated code builds "
+                                       "the command %r — %s"
+                                       % (joined[:80], bv["reason"]))
+    except Exception:
+        pass
     if result["decision"] in ("defer", "allow"):
         if re.search(r"shutil\.rmtree|os\.walk|Remove-Item[^;\n]*-Recurse", code) and \
                 not re.search(r"islink|follow_symlinks\s*=\s*False|followlinks\s*=\s*False|LinkType|junction", code, re.I):
@@ -2490,7 +2929,13 @@ def write_audit(record, cwd):
             # The read-tail + append must be atomic across processes:
             # two agent sessions in one project would otherwise chain
             # off the same prev_hash and break the chain.
-            with open(candidate, "a+", encoding="utf-8") as fh:
+            # Audit lines carry (redacted) commands and paths — create
+            # the log owner-only (0600), not umask-default.
+            def _audit_opener(path, flags):
+                return os.open(path, flags, 0o600)
+
+            with open(candidate, "a+", encoding="utf-8",
+                      opener=_audit_opener) as fh:
                 locked = False
                 try:
                     import fcntl
@@ -2868,7 +3313,12 @@ def evaluate_file(tool_name, file_path, overlay=None, mode="enforce",
         or norm == plugin_root + "/install.py" \
         or norm.startswith(home_seat + "/") \
         or norm.endswith("/.seatbelt/policy.json") \
-        or norm.endswith("/.seatbelt/audit.jsonl")
+        or norm.endswith("/.seatbelt/audit.jsonl") \
+        or "/.seatbelt/" in norm  # whole state dir: plan.json,
+        # skills-baseline.json, taint.json, snapshots/, checkpoints —
+        # an agent that can rewrite Seatbelt's state can file its own
+        # flight plan, re-baseline its own drift watch, or clear its
+        # own taint. Writes deny; reads stay transparent (above).
     if tool_name == "Read" and (is_seatbelt_path or _GOV_ASK_PATH.search(norm)):
         candidates.append(_decision(
             "allow", "seatbelt-transparency-read",
@@ -2891,6 +3341,20 @@ def evaluate_file(tool_name, file_path, overlay=None, mode="enforce",
 _eval_bash_r2 = evaluate_bash
 _DESTRUCTIVE_RULE_HINTS = ("cloud", "db-", "git-", "deploy", "publish", "schema")
 
+# Bash-side twin of the file-tool self-protection: write verbs or a
+# redirect aimed at anything under a .seatbelt/ state directory.
+# (Reads — cat/ls/grep of .seatbelt files — are NOT matched: the
+# transparency stance keeps Seatbelt's state inspectable.)
+_STATE_TAMPER_RE = re.compile(
+    r"\b(?:rm|shred|truncate|mv|cp|tee|install|ln|chmod|chown|dd)\b"
+    r"[^;&\n]*\.seatbelt[/\\]"
+    r"|\bsed\b[^;&\n]*\s-(i|--in-place)\b[^;&\n]*\.seatbelt[/\\]"
+    r"|>>?\s*\S*\.seatbelt[/\\]")
+
+
+def _seatbelt_state_tamper(text):
+    return bool(_STATE_TAMPER_RE.search(text))
+
 
 def evaluate_bash(command, overlay=None, mode="enforce", cwd=None, _depth=0):
     result = _eval_bash_r2(command, overlay, mode, cwd, _depth)
@@ -2910,12 +3374,32 @@ def evaluate_bash(command, overlay=None, mode="enforce", cwd=None, _depth=0):
             for fn, rule_id, why in (
                     (_pipe_to_shell, "seatbelt-locked-pipe-to-shell",
                      "piping a remote download straight into a shell executes unreviewed code"),
+                    (_download_then_exec, "seatbelt-locked-pipe-to-shell",
+                     "this command downloads a file and executes it in the same breath — the pipe-to-shell shape with a stopover on disk; download it, review it, then run it as a separate step"),
                     (_secret_exfil, "seatbelt-locked-secret-exfiltration",
                      "the command touches a secret AND a network tool in one step — that is the exfiltration shape")):
                 if fn(full) and _TIER_RANK[result["decision"]] < 3:
                     result = _finish(_decision("deny", rule_id, why, mode),
                                      str(command), cwd)
                     break
+            # Phase 2: the decoded-forms verdict also runs on the
+            # NORMALIZED full text — mutation layers ($IFS insertion,
+            # quote fragmentation, $VAR command names, subshell wraps)
+            # are undone by normalization, and the raw-text pass inside
+            # evaluate_bash cannot see through them.
+            if result["decision"] != "deny" and _depth < 3:
+                dv = _decoded_forms_verdict(full, mode, _depth)
+                if dv and _TIER_RANK[dv["decision"]] > \
+                        _TIER_RANK[result["decision"]]:
+                    result = _finish(dv, str(command), cwd)
+            # Same reasoning for the DNS-substitution verdict: a
+            # quote-fragmented tool name (h"o"st) defeats the raw-text
+            # pass but not the normalized one.
+            if result["decision"] != "deny":
+                nv = _dns_exfil_verdict(full, mode, extra_subs=subs)
+                if nv and _TIER_RANK[nv["decision"]] > \
+                        _TIER_RANK[result["decision"]]:
+                    result = _finish(nv, str(command), cwd)
             if result["decision"] != "deny":
                 # Redirect-inclusive shapes (reverse shells write to
                 # /dev/tcp via a redirect the segment pass splits
@@ -2938,17 +3422,26 @@ def evaluate_bash(command, overlay=None, mode="enforce", cwd=None, _depth=0):
                         result = _finish(_decision("deny", hit[0], hit[1], mode),
                                          str(command), cwd)
                         break
+            if result["decision"] != "deny" and _seatbelt_state_tamper(full):
+                result = _finish(_decision(
+                    "deny", "seatbelt-locked-self-protection",
+                    "this writes to Seatbelt's own state directory "
+                    "(.seatbelt/) — the policy, flight plan, baselines, "
+                    "taint and snapshots are the human's controls, not "
+                    "the agent's to rewrite", mode), str(command), cwd)
             if result["decision"] != "deny" and re.search(r"[<>]\(", str(command)) \
                     and re.search(r"\b(curl|wget)\b", " ".join(subs)) and parts:
                 head0 = parts[0][1].split()[0] if parts[0][1].split() else ""
-                if head0 in ("bash", "sh", "zsh"):
+                if head0 in ("bash", "sh", "zsh", "dash", "ash", "source", ".",
+                             "python", "python3", "python2", "node", "nodejs",
+                             "ruby", "perl", "php", "deno", "bun"):
                     result = _finish(_decision(
                         "deny", "seatbelt-locked-pipe-to-shell",
-                        "a shell is executing a process substitution fed by a download", mode),
+                        "a shell or interpreter is executing a process substitution fed by a download", mode),
                         str(command), cwd)
             if result["decision"] != "deny" and parts and subs:
                 head0 = parts[0][1].split()[0] if parts[0][1].split() else ""
-                if head0 in ("eval", "exec") and any(
+                if head0 in ("eval", "exec", "bash", "sh", "zsh", "dash") and any(
                         re.search(r"\b(curl|wget)\b", s) for s in subs):
                     result = _finish(_decision(
                         "deny", "seatbelt-locked-pipe-to-shell",
@@ -3468,6 +3961,43 @@ def _enumerate_snapshot_targets(payload, kind, cwd):
     return out[:500]
 
 
+def _mint_snapshot_id(base, ts):
+    """Mint a snapshot id of the form <ts>-<uuid6> that sorts after
+    every snapshot id already stored for the same second.
+
+    Snapshot consumers (_prune_snapshots, run_snapshots) order by
+    directory name, so name order has to be creation order. A purely
+    random suffix breaks that within one second: two snapshots taken
+    in the same second sort by their random suffixes, and the
+    "newest" pick becomes a coin flip (this is what made
+    test_restore_reverts_edit_and_is_undoable fail on fast runners).
+    When the random suffix would not sort after the largest suffix
+    already present for this second, it is bumped to one past it.
+    The hex space cannot realistically exhaust (16M snapshots in one
+    second); if it ever did, the prefix rolls to the next second."""
+    prefix = ts.strftime("%Y%m%dT%H%M%S") + "-"
+    while True:
+        suffix = uuid.uuid4().hex[:6]
+        try:
+            existing = [d.name[len(prefix):] for d in base.iterdir()
+                        if d.is_dir() and d.name.startswith(prefix)
+                        and len(d.name) == len(prefix) + 6
+                        and all(ch in "0123456789abcdef"
+                                for ch in d.name[len(prefix):])]
+        except OSError:
+            existing = []
+        if existing:
+            top = max(existing)
+            if suffix <= top:
+                if int(top, 16) < 0xFFFFFF:
+                    suffix = "%06x" % (int(top, 16) + 1)
+                else:
+                    ts = ts + timedelta(seconds=1)
+                    prefix = ts.strftime("%Y%m%dT%H%M%S") + "-"
+                    continue
+        return prefix + suffix
+
+
 def take_snapshot(cwd, targets, trigger):
     """Copy the current state of `targets` into
     .seatbelt/snapshots/<ts>-<id>/ with a sha256 manifest. Links are
@@ -3476,8 +4006,19 @@ def take_snapshot(cwd, targets, trigger):
     base = _snap_root(cwd)
     base.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc)
-    sid = ts.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
-    sdir = base / sid
+    # Claim the snapshot directory atomically: two hooks minting in
+    # the same second for the same project re-mint on collision
+    # instead of merging into one directory.
+    for _attempt in range(100):
+        sid = _mint_snapshot_id(base, ts)
+        sdir = base / sid
+        try:
+            sdir.mkdir(parents=True, exist_ok=False)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise RuntimeError("could not mint a unique snapshot id")
     (sdir / "files").mkdir(parents=True, exist_ok=True)
     manifest = {"id": sid, "ts": ts.isoformat(), "trigger": redact(str(trigger))[:160],
                 "files": [], "skipped_too_large": [], "skipped_missing": [],
@@ -3536,7 +4077,13 @@ def take_snapshot(cwd, targets, trigger):
         stored = "files/%d" % state["idx"]
         state["idx"] += 1
         digest = hashlib.sha256()
-        with open(path, "rb") as src, open(sdir / stored, "wb") as dst:
+        # Snapshot copies duplicate file contents under .seatbelt/ —
+        # never store them more readable than owner-only.
+        def _snap_opener(p, flags):
+            return os.open(p, flags, 0o600)
+
+        with open(path, "rb") as src, open(sdir / stored, "wb",
+                                           opener=_snap_opener) as dst:
             while True:
                 chunk = src.read(1024 * 256)
                 if not chunk:
@@ -4368,6 +4915,38 @@ def evaluate_file(tool_name, file_path, overlay=None, mode="enforce",
                   content=None, cwd=None):
     result = _eval_file_r3(tool_name, file_path, overlay, mode,
                            content=content, cwd=cwd)
+    # Phase 2 audit fix (2026-10-14): /proc/sysrq-trigger is a kernel
+    # command channel, not a file — any write to it fires an immediate
+    # kernel action (reboot/poweroff). Deny outright for write tools;
+    # shell redirects land here too via _redirect_verdict.
+    if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        _p = str(file_path or "").replace("\\", "/")
+        if _p.endswith("/proc/sysrq-trigger") or "/proc/sysrq-" in _p:
+            return _add_remed({
+                "decision": "deny",
+                "rule_id": "seatbelt-locked-sysrq",
+                "reason": "writing to /proc/sysrq-trigger triggers an "
+                          "immediate kernel action (reboot, poweroff, "
+                          "sync) with no userspace cleanup"})
+    # Phase 2 audit fix (2026-10-14): cron spool and system scheduler
+    # locations are persistence writes. Bash-side crontab edits were
+    # already gated, but a Write/Edit straight into the spool deferred.
+    if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit") \
+            and result["decision"] in ("defer", "allow"):
+        _norm = os.path.realpath(os.path.expanduser(
+            str(file_path or ""))).replace("\\", "/")
+        if re.search(r"/var/spool/cron/|/etc/crontab$|/etc/cron\."
+                     r"(d|daily|hourly|weekly|monthly)/"
+                     r"|/etc/systemd/system/[^/]+\.service$"
+                     r"|/Library/(LaunchAgents|LaunchDaemons)/"
+                     r"|/\.config/systemd/user/[^/]+\.service$", _norm):
+            return _add_remed({
+                "decision": "ask",
+                "rule_id": "seatbelt-locked-persistence-write",
+                "reason": "this writes directly into a scheduler/"
+                          "persistence location (%s) — scheduled tasks "
+                          "outlive the session and run unattended"
+                          % _norm})
     if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         resolved = os.path.realpath(os.path.expanduser(str(file_path or "")))
         norm = resolved.replace("\\", "/")
@@ -4405,6 +4984,77 @@ LOCKED_ASK = LOCKED_ASK + [
     ("seatbelt-locked-cloud-delete",
      lambda c: bool(re.search(r"\brailway\s+volume\s+delete\b|\bdeleteVolume\b", c)),
      "this deletes a hosted volume/database through a cloud API shape"),
+]
+
+def _find_delete_root(c):
+    """Phase 2 helper: find -delete is deny-class when it starts at a
+    filesystem/home root (any filters) or has NO narrowing filter at
+    all (an unfiltered tree wipe from any root). A filtered find in a
+    subdirectory stays ask-class (incident-cowork-photos-find)."""
+    m = re.search(r"\bfind\s+(\S+)[^;&\n]*\s-delete\b", c)
+    if not m:
+        return False
+    if m.group(1) in ("/", "~", "$HOME", "/home", "/Users"):
+        return True
+    filters = ("-name", "-iname", "-path", "-ipath", "-regex",
+               "-iregex", "-type", "-newer", "-mtime", "-mmin",
+               "-size", "-user", "-group", "-perm", "-empty")
+    seg_tokens = c[m.start():].split()
+    return not any(f in seg_tokens for f in filters)
+
+
+# ── Phase 2 audit extensions (2026-10-14) ────────────────────────────
+# Fresh mutation families from the 0.3.2 adversarial probing pass that
+# the shipped corpus did not cover. Each rule ships with bench cases
+# (destructive + benign near-miss) in bench/cases.jsonl.
+LOCKED_DENY = LOCKED_DENY + [
+    ("seatbelt-locked-device-wipe",
+     lambda c: bool(re.search(r"\bwipefs\b|\bblkdiscard\b|\bnvme\s+format\b|\bsgdisk\b[^;&\n]*(--zap|--clear)|\bhdparm\b[^;&\n]*--security-erase", c)),
+     "wiping a device's signatures or blocks destroys its contents as surely as formatting it"),
+    ("seatbelt-locked-sysrq",
+     lambda c: bool(re.search(r"([<>]|tee|dd|echo|printf|cp|mv|install)\b[^;&\n]*sysrq-trigger|sysrq-trigger[^;&\n]*(>|of=)", c)),
+     "writing to /proc/sysrq-trigger triggers immediate kernel actions (reboot, poweroff, sync) with no userspace cleanup"),
+    ("seatbelt-locked-find-delete-root",
+     lambda c: _find_delete_root(c),
+     "find -delete from a broad root (or any root, unfiltered) is recursive deletion by another name"),
+    ("seatbelt-locked-code-rmtree-root",
+     lambda c: bool(re.search(r"\bunlink\s*\(\s*['\"]/['\"]\s*,\s*recursive\s*=\s*(TRUE|T|True)", c)),
+     "recursive unlink of the filesystem root destroys the machine's contents"),
+    ("seatbelt-locked-cloud-delete",
+     lambda c: bool(re.search(r"\bkubectl\s+delete\s+[\w/.-]+\s+--all\b|\bkubectl\s+delete\b[^;&\n]*--all-namespaces", c)),
+     "deleting every resource of a type, or across all namespaces, wipes a cluster's workloads at once"),
+    ("seatbelt-locked-secret-exfiltration",
+     lambda c: bool(re.search(r"\b(rsync|rclone)\b[^;&\n]*(\.env\b|id_rsa|id_ed25519|\.aws[/\\]|\.ssh[/\\]|credentials)", c)) and bool(re.search(r"[\w.-]+@[\w.-]+:|[\w.-]+:|\bremote:", c)),
+     "a sync tool sending a secret file to a remote destination is the exfiltration shape"),
+    ("seatbelt-locked-secret-exfiltration",
+     lambda c: bool(re.search(r"(\.env|id_rsa|id_ed25519|\.aws[/\\]credentials|\.netrc)[^;&\n]*/dev/tcp/|/dev/tcp/[^;&\n]*(\.env|id_rsa|credentials)", c)),
+     "a secret file moving over a raw /dev/tcp socket is the exfiltration shape"),
+]
+LOCKED_ASK = LOCKED_ASK + [
+    ("seatbelt-locked-find-delete",
+     lambda c: bool(re.search(r"\bfind\b[^;&\n]*\s-delete\b", c)),
+     "find -delete removes every matched file without a trash step"),
+    ("seatbelt-locked-setuid",
+     lambda c: bool(re.search(r"\bchmod\b[^;&\n]*(\bu\+s\b|\ba\+s\b|\+s[a-z]*\b|\b[2-7][0-7]{3}\b)", c)),
+     "setting setuid/setgid bits can hand out privilege escalation; a human should confirm the target"),
+    ("seatbelt-locked-account-delete",
+     lambda c: bool(re.search(r"\b(userdel|groupdel)\b", c)),
+     "deleting a user or group (userdel -r also removes the home directory) is hard to undo"),
+    ("seatbelt-locked-log-vacuum",
+     lambda c: bool(re.search(r"\bjournalctl\b[^;&\n]*--vacuum", c)),
+     "vacuuming the journal destroys system logs, including the record of what happened on this machine"),
+    ("seatbelt-locked-git-checkout-discard",
+     lambda c: bool(re.search(r"\bgit\s+checkout\s+(--\s+)?\.(\s|$)", c)),
+     "git checkout . discards every uncommitted change in the tree"),
+    ("seatbelt-locked-cloud-delete",
+     lambda c: bool(re.search(r"\bkubectl\s+delete\b", c)),
+     "kubectl delete removes live workloads or their data; a name alone cannot prove it is safe"),
+    ("seatbelt-locked-docker-prune",
+     lambda c: bool(re.search(r"\bdocker\s+(system\s+)?prune\b[^;&\n]*--volumes|\bdocker\s+volume\s+(prune|rm)\b|\bdocker\s+system\s+prune\b[^;&\n]*(\s-a\b|--all\b)|\bdocker[ -]compose\s+down\b[^;&\n]*(\s-v\b|--volumes\b)", c)),
+     "pruning with volumes (or removing volumes) destroys container data that is not in any image"),
+    ("seatbelt-locked-cmd-bcdedit",
+     lambda c: bool(re.search(r"\bbcdedit\b", c)),
+     "bcdedit changes boot configuration"),
 ]
 
 # X2: Flight Plan.
@@ -5071,6 +5721,56 @@ def run_hook(raw):
         import io
         agent = _agent_for(payload, event)
         session_id = payload.get("session_id") or payload.get("sessionId") or ""
+        # Phase 2 audit fix (2026-10-14): envelope shape gate. Valid
+        # JSON with wrong-shaped fields used to be silently deferred
+        # (fail-open): tool_input as a bare string, a non-string
+        # command, or a missing/unknown tool_name carrying a command
+        # all slipped past classification while unparseable input
+        # already failed closed. Canonicalize near-miss tool names so
+        # the command still gets classified, and fail closed on shapes
+        # no real host sends.
+        _gated = {"bash": "Bash", "powershell": "PowerShell",
+                  "write": "Write", "edit": "Edit",
+                  "multiedit": "MultiEdit", "notebookedit": "NotebookEdit",
+                  "read": "Read"}
+        _raw_input = None
+        for _k in ("tool_input", "input", "toolInput"):
+            if _k in payload:
+                _raw_input = payload.get(_k)
+                break
+        _shape_fail = None
+        if _raw_input is not None and not isinstance(_raw_input, dict):
+            _shape_fail = "tool_input is not an object"
+        elif not str(tool_name).strip():
+            _shape_fail = "tool_name is missing"
+        elif isinstance(_raw_input, dict) and "command" in _raw_input \
+                and not isinstance(_raw_input.get("command"), str):
+            _shape_fail = "tool_input.command is not a string"
+        if _shape_fail:
+            try:
+                write_audit({"ts": _now(), "event": event,
+                             "session_id": session_id, "cwd": cwd,
+                             "mode": "enforce", "version": VERSION,
+                             "agent": agent, "tool_name": str(tool_name),
+                             "decision": "deny",
+                             "rule_id": "seatbelt-hook-fail-closed",
+                             "reason": _shape_fail}, cwd)
+            except Exception:
+                pass
+            return _deny_envelope(
+                agent, "Seatbelt could not parse this tool call "
+                "(%s); failing closed" % _shape_fail)
+        _canon = _gated.get(str(tool_name).strip().lower())
+        if _canon and _canon != tool_name:
+            payload["tool_name"] = _canon
+            tool_name = _canon
+            raw = json.dumps(payload)
+        elif _canon is None and not tool_name.startswith("mcp__") \
+                and isinstance(_raw_input, dict) \
+                and isinstance(_raw_input.get("command"), str):
+            payload["tool_name"] = "Bash"
+            tool_name = "Bash"
+            raw = json.dumps(payload)
         is_mcp = tool_name.startswith("mcp__")
         mcp_server = ""
         if is_mcp:
@@ -5589,6 +6289,677 @@ def main_r8(argv=None):
 
 
 main = main_r8
+
+
+# =====================================================================
+# SHINE ROUND 9 (v0.3.0): J1 judge escalation seam + J2 skill/plugin
+# drift watch.
+#
+# J1 — the judge. An OPTIONAL, user-configured local command that sees
+# the deterministic verdict on allow/ask-tier calls and may raise it
+# exactly ONE tier (allow->ask, ask->deny). It can never lower, clear,
+# or suppress anything: replies that try are ignored and audit-logged
+# as anomalies, and malformed/timeout/crash replies leave the
+# deterministic verdict untouched. Off by default; in audit/shadow
+# modes (observe-only) it never runs at all. Enforcement lives here,
+# never in the judge.
+#
+# J2 — skill & plugin drift. A human-filed baseline of sha256+size
+# fingerprints for the installed skill/plugin surface (project +
+# user scope; names and hashes only, never contents). Drift is
+# surfaced at SessionStart and via --skills, audit-logged once per
+# distinct drift set, and never blocks by itself in solo/enforce
+# mode. In strict/CI mode the FIRST escalatable call after a drift
+# is raised one tier (the MCP rug-pull precedent from round 7).
+# Re-baselining is explicit and audit-logged; nothing auto-updates.
+# =====================================================================
+
+REMEDIATIONS.update({
+    "seatbelt-judge": "A configured judge raised this verdict one tier. "
+                      "The judge can only ever make Seatbelt stricter; "
+                      "if the escalation is wrong, fix or disable the "
+                      "judge in .seatbelt/policy.json — the "
+                      "deterministic verdict underneath is unchanged.",
+    "seatbelt-skill-drift": "Skill/plugin files differ from the human "
+                            "baseline. Review with --skills; if the "
+                            "change was yours, re-baseline with "
+                            "--skills-baseline --accept. If it was "
+                            "not, treat the changed skills as "
+                            "untrusted until reviewed.",
+    "seatbelt-skill-baseline": "The skill baseline moves only by a "
+                               "human running --skills-baseline "
+                               "--accept.",
+})
+
+_ASI_BY_RULE.update({
+    "seatbelt-judge": "ASI02",
+    "seatbelt-skill-drift": "ASI04",
+    "seatbelt-skill-baseline": "ASI04",
+})
+
+
+# ── J1: the judge seam ────────────────────────────────────────────────
+
+_JUDGE_REASON_CAP = 200
+_JUDGE_STDOUT_CAP = 256 * 1024
+_JUDGE_CLEAR_KEYS = ("decision", "verdict", "allow", "clear",
+                     "suppress", "override", "permissionDecision")
+
+
+def _judge_config(cwd):
+    """The configured judge, or None. Config follows the policy-file
+    pattern: .seatbelt/policy.json -> "judge": {"command": ...,
+    "timeout_ms": ...}; SEATBELT_JUDGE_COMMAND /
+    SEATBELT_JUDGE_TIMEOUT_MS override it. No command = no judge:
+    the seam then costs one small file read and nothing else."""
+    cfg = {}
+    try:
+        doc = json.loads((Path(cwd) / ".seatbelt" / "policy.json")
+                         .read_text(encoding="utf-8"))
+        if isinstance(doc, dict) and isinstance(doc.get("judge"), dict):
+            cfg = doc["judge"]
+    except Exception:
+        cfg = {}
+    env_cmd = os.environ.get("SEATBELT_JUDGE_COMMAND", "")
+    if cfg.get("enabled") is False and not env_cmd.strip():
+        return None
+    command = env_cmd.strip() or cfg.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    raw_timeout = os.environ.get("SEATBELT_JUDGE_TIMEOUT_MS") or \
+        cfg.get("timeout_ms", 3000)
+    try:
+        timeout_ms = int(raw_timeout)
+    except Exception:
+        timeout_ms = 3000
+    timeout_ms = max(100, min(timeout_ms, 30000))
+    return {"command": command.strip(), "timeout_ms": timeout_ms}
+
+
+def _judge_invoke(cfg, brief):
+    """Run the judge once. Returns (outcome, judge_reason) with
+    outcome in escalated | no-raise | timeout | crash | malformed |
+    clear-attempt. Only 'escalated' may change a verdict, and only
+    ever one tier up — enforced here and by the caller, never
+    trusted to the judge's own output."""
+    try:
+        proc = subprocess.run(cfg["command"], shell=True,
+                              input=json.dumps(brief),
+                              capture_output=True, text=True,
+                              timeout=cfg["timeout_ms"] / 1000.0)
+    except subprocess.TimeoutExpired:
+        return "timeout", ""
+    except Exception:
+        return "crash", ""
+    if proc.returncode != 0:
+        return "crash", ""
+    try:
+        reply = json.loads((proc.stdout or "").strip()
+                           [:_JUDGE_STDOUT_CAP])
+    except Exception:
+        return "malformed", ""
+    if not isinstance(reply, dict):
+        return "malformed", ""
+    if any(k in reply for k in _JUDGE_CLEAR_KEYS):
+        # The reply tried to speak in verdicts — including attempts
+        # to clear or lower one. Verdicts are not the judge's to
+        # give: the whole reply is ignored and logged as an anomaly.
+        return "clear-attempt", ""
+    esc = reply.get("escalate")
+    if not isinstance(esc, bool):
+        return "malformed", ""
+    if not esc:
+        return "no-raise", ""
+    reason = reply.get("reason")
+    if not isinstance(reason, str):
+        reason = ""
+    return "escalated", _sanitize_value(reason)[:_JUDGE_REASON_CAP]
+
+
+def _judge_eval_record(cwd, session_id, tool_name):
+    """(record, plan_covered) for the call the inner layers just
+    decided: the newest hook-event audit record for this session +
+    tool, and whether a flight plan covered (de-escalated) it
+    afterwards. No record => the tool was never gated or evaluated,
+    so there is no deterministic verdict for a judge to raise."""
+    record = None
+    plan_covered = False
+    for row in _read_audit_tail(cwd, 60):
+        if row.get("session_id") != session_id:
+            continue
+        if row.get("event") in ("PreToolUse", "BeforeTool",
+                                "preToolUse") \
+                and row.get("tool_name") == tool_name:
+            record = row
+            plan_covered = False
+        elif record is not None and row.get("event") == "plan" \
+                and row.get("decision") == "on-plan-defer":
+            plan_covered = True
+    return record, plan_covered
+
+
+def _semantic_tier(decision, reason, agent_key):
+    """Map an emitted envelope to its semantic tier. Gemini has no
+    ask envelope — an ask is transported as a deny whose reason
+    carries the Seatbelt ASK marker — so recognise it here."""
+    if decision == "ask":
+        return "ask"
+    if decision == "deny":
+        if agent_key == "gemini" and reason and "Seatbelt ASK" in reason:
+            return "ask"
+        return "deny"
+    return "allow"
+
+
+def _r9_judge(payload, cwd, text):
+    """Apply the J1 seam to a finished PreToolUse envelope. Returns
+    the (possibly rewritten) envelope text. The deterministic
+    verdict is already final in `text`; this layer can only raise
+    it one tier, and only when a judge is configured."""
+    event = payload.get("hook_event_name") or \
+        payload.get("hookEventName") or ""
+    tool_name = payload.get("tool_name") or payload.get("toolName") or ""
+    session_id = payload.get("session_id") or \
+        payload.get("sessionId") or ""
+    agent = _agent_for(payload, event)
+    agent_key = agent if agent in ("claude", "gemini", "cursor") \
+        else "claude"
+    decision, reason = _parse_envelope(text, agent_key)
+    tier = _semantic_tier(decision, reason, agent_key)
+    if tier == "deny":
+        return text  # a deny is final; the judge never runs on one
+    _overlay9, mode = _resolve_mode_overlay(cwd)
+    if mode in ("audit", "shadow"):
+        return text  # observe-only modes emit nothing to escalate
+    cfg = _judge_config(cwd)
+    if cfg is None:
+        return text
+    record, plan_covered = _judge_eval_record(cwd, session_id, tool_name)
+    if record is None or plan_covered:
+        return text
+    brief = {
+        "tool": tool_name,
+        "agent": agent,
+        "action": _target_summary(
+            tool_name, payload.get("tool_input") or {}),
+        "verdict": tier,
+        "rules": [record["rule_id"]] if record.get("rule_id") else [],
+        "cwd": str(cwd),
+        "taint": bool(_taint_active(cwd)),
+        "session_id": session_id,
+    }
+    outcome, judge_reason = _judge_invoke(cfg, brief)
+    audit = {"ts": _now(), "event": event, "session_id": session_id,
+             "cwd": cwd, "tool_name": tool_name,
+             "rule_id": "seatbelt-judge", "judge_outcome": outcome,
+             "from_verdict": tier, "command": cfg["command"][:120]}
+    if outcome == "escalated":
+        new_tier = "ask" if tier == "allow" else "deny"
+        audit["decision"] = new_tier
+        audit["judge_reason"] = judge_reason
+        try:
+            write_audit(audit, cwd)
+        except Exception:
+            pass
+        note = (" Judge raised this verdict (%s -> %s): %s"
+                % (tier, new_tier, judge_reason or "no reason given"))
+        return _rewrite_envelope(agent_key, new_tier,
+                                 (reason or "") + note)
+    audit["decision"] = "flagged" if outcome not in ("no-raise",) \
+        else ("defer" if tier == "allow" else tier)
+    try:
+        write_audit(audit, cwd)
+    except Exception:
+        pass
+    return text
+
+
+# ── J2: skill & plugin drift watch ───────────────────────────────────
+
+_SKILL_HASH_CAP = 16 * 1024 * 1024
+_SKILL_FILE_CAP = 2000
+_SKILL_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".seatbelt"}
+_SKILL_HOOK_SUFFIXES = {".py", ".sh", ".js", ".ts", ".json", ".md"}
+
+
+def _skill_baseline_path(cwd):
+    return Path(cwd) / ".seatbelt" / "skills-baseline.json"
+
+
+def _skill_state_path(cwd):
+    return Path(cwd) / ".seatbelt" / "skills-state.json"
+
+
+def _skill_files(cwd):
+    """Discover the installed skill/plugin surface: sorted, deduped
+    (abspath, scope) pairs. Categories: SKILL.md files, commands
+    *.md, hooks files, .claude-plugin manifests — under project
+    .claude/, the project root (plugin-repo layout), and user
+    ~/.claude/. Bounded by a file-count cap and skip dirs."""
+    proj = Path(cwd)
+    home = Path.home()
+    found = {}
+
+    def walk_files(base):
+        if not base.is_dir():
+            return
+        for root, dirs, files in os.walk(base):
+            dirs[:] = sorted(d for d in dirs
+                             if d not in _SKILL_SKIP_DIRS)
+            for name in sorted(files):
+                yield Path(root) / name
+
+    def collect(base, scope, pred):
+        for p in walk_files(base):
+            if len(found) >= _SKILL_FILE_CAP:
+                return
+            if not pred(p):
+                continue
+            try:
+                rp = str(p.resolve())
+            except Exception:
+                rp = str(p)
+            if rp not in found:
+                found[rp] = scope
+
+    for base, scope in ((proj / ".claude", "project"),
+                        (home / ".claude", "user")):
+        collect(base / "skills", scope, lambda p: p.name == "SKILL.md")
+        collect(base / "commands", scope, lambda p: p.suffix == ".md")
+        collect(base / "hooks", scope,
+                lambda p: p.suffix in _SKILL_HOOK_SUFFIXES)
+        collect(base / "plugins", scope,
+                lambda p: p.name == "SKILL.md" or
+                (p.parent.name == ".claude-plugin"
+                 and p.suffix == ".json"))
+    # Plugin-repo layout at the project root (this repo's own shape).
+    collect(proj / "skills", "project", lambda p: p.name == "SKILL.md")
+    collect(proj / "commands", "project", lambda p: p.suffix == ".md")
+    collect(proj / "hooks", "project",
+            lambda p: p.suffix in _SKILL_HOOK_SUFFIXES)
+    collect(proj / ".claude-plugin", "project",
+            lambda p: p.suffix == ".json")
+    return sorted(found.items())
+
+
+def _skill_fingerprint(path):
+    """{"sha256", "size", "partial"} — full-content hash up to the
+    cap; above it, a hash of size + head + tail (partial=True says
+    so on the record)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            if size <= _SKILL_HASH_CAP:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                return {"sha256": h.hexdigest(), "size": size,
+                        "partial": False}
+            head = fh.read(65536)
+            fh.seek(max(0, size - 65536))
+            tail = fh.read(65536)
+            h.update(str(size).encode())
+            h.update(head)
+            h.update(tail)
+            return {"sha256": h.hexdigest(), "size": size,
+                    "partial": True}
+    except OSError:
+        return None
+
+
+def _skill_snapshot(cwd):
+    files = {}
+    discovered = _skill_files(cwd)
+    for path, scope in discovered:
+        fp = _skill_fingerprint(path)
+        if fp is None:
+            continue
+        fp["scope"] = scope
+        files[path] = fp
+    return files, len(discovered) >= _SKILL_FILE_CAP
+
+
+def _skill_baseline(cwd):
+    try:
+        doc = json.loads(_skill_baseline_path(cwd)
+                         .read_text(encoding="utf-8"))
+        return doc if isinstance(doc, dict) else None
+    except Exception:
+        return None
+
+
+def _skill_state(cwd):
+    try:
+        doc = json.loads(_skill_state_path(cwd)
+                         .read_text(encoding="utf-8"))
+        return doc if isinstance(doc, dict) else {}
+    except Exception:
+        return {}
+
+
+def _skill_state_save(cwd, state):
+    try:
+        path = _skill_state_path(cwd)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def run_skills_baseline(accept=False, out=sys.stdout):
+    cwd = os.getcwd()
+    existing = _skill_baseline(cwd)
+    if existing and not accept:
+        out.write("Skill baseline already exists (%d files, created "
+                  "%s).\nThe baseline moves ONLY by a human running: "
+                  "--skills-baseline --accept\n"
+                  % (len(existing.get("files", {})),
+                     existing.get("created", "?")))
+        return 0
+    files, capped = _skill_snapshot(cwd)
+    doc = {"created": _now(), "surface": "skills", "files": files,
+           "capped": capped}
+    try:
+        path = _skill_baseline_path(cwd)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+    except OSError as exc:
+        out.write("Could not write skill baseline: %s\n" % exc)
+        return 1
+    # A fresh baseline defines "no drift": clear the drift memory.
+    _skill_state_save(cwd, {})
+    if accept:
+        write_audit({"ts": _now(), "event": "skills-baseline",
+                     "session_id": "", "cwd": cwd,
+                     "rule_id": "seatbelt-skill-baseline",
+                     "decision": "accepted", "files": len(files)}, cwd)
+    out.write("Skill baseline %s: %d file(s) fingerprinted (sha256 + "
+              "size only - file contents are never copied) to %s\n"
+              % ("accepted" if accept else "created", len(files),
+                 _skill_baseline_path(cwd)))
+    if capped:
+        out.write("NOTE: discovery hit the %d-file cap; the baseline "
+                  "covers the first %d files in sorted order.\n"
+                  % (_SKILL_FILE_CAP, _SKILL_FILE_CAP))
+    return 0
+
+
+def _skill_drift(cwd):
+    """(entries, digest) or (None, None): entries are
+    {"path", "scope", "kind"} with kind changed|new|deleted."""
+    baseline = _skill_baseline(cwd)
+    if not baseline:
+        return None, None
+    current, _capped = _skill_snapshot(cwd)
+    base_files = baseline.get("files", {})
+    entries = []
+    for path, base in base_files.items():
+        cur = current.get(path)
+        if cur is None:
+            entries.append({"path": path,
+                            "scope": base.get("scope", ""),
+                            "kind": "deleted"})
+        elif cur["sha256"] != base["sha256"] or \
+                cur["size"] != base["size"]:
+            entries.append({"path": path,
+                            "scope": base.get("scope", ""),
+                            "kind": "changed"})
+    for path, cur in current.items():
+        if path not in base_files:
+            entries.append({"path": path,
+                            "scope": cur.get("scope", ""),
+                            "kind": "new"})
+    if not entries:
+        return None, None
+    entries.sort(key=lambda e: e["path"])
+    digest = hashlib.sha256(json.dumps(
+        [(e["path"], e["kind"]) for e in entries],
+        sort_keys=True).encode()).hexdigest()
+    return entries, digest
+
+
+def _skill_drift_block(cwd):
+    """(text, digest) when drift exists AND this exact drift set has
+    not been surfaced yet; writes the SessionStart audit event once
+    per distinct drift set (the brain-drift dedupe precedent)."""
+    entries, digest = _skill_drift(cwd)
+    if not entries:
+        return None, None
+    state = _skill_state(cwd)
+    if state.get("last_drift_hash") == digest:
+        return None, digest
+    state["last_drift_hash"] = digest
+    _skill_state_save(cwd, state)
+    try:
+        write_audit({"ts": _now(), "event": "SessionStart",
+                     "session_id": "", "cwd": cwd,
+                     "rule_id": "seatbelt-skill-drift",
+                     "decision": "flagged",
+                     "drift_paths": [e["path"] for e in entries][:20],
+                     "kinds": {k: sum(1 for e in entries
+                                       if e["kind"] == k)
+                               for k in ("changed", "new",
+                                          "deleted")}}, cwd)
+    except Exception:
+        pass
+    names = ["%s (%s)" % (e["path"].rsplit("/", 1)[-1], e["kind"])
+             for e in entries[:3]]
+    more = " +%d more" % (len(entries) - 3) if len(entries) > 3 else ""
+    text = ("🧩 Skill drift: %d skill/plugin file(s) differ from the "
+            "human baseline - %s%s. Run `python3 hooks/seatbelt_hook.py "
+            "--skills` to review; if the change was yours, re-baseline "
+            "with --skills-baseline --accept."
+            % (len(entries), "; ".join(names), more))
+    return text, digest
+
+
+def run_skills(out=sys.stdout):
+    cwd = os.getcwd()
+    baseline = _skill_baseline(cwd)
+    if not baseline:
+        out.write("No skill baseline yet. Create one (human only): "
+                  "--skills-baseline\n")
+        return 0
+    entries, _digest = _skill_drift(cwd)
+    if not entries:
+        out.write("Skill drift: none. %d watched file(s) match the "
+                  "baseline from %s.\n"
+                  % (len(baseline.get("files", {})),
+                     baseline.get("created", "?")))
+        return 0
+    out.write("Skill drift report (baseline %s):\n"
+              % baseline.get("created"))
+    for e in entries:
+        out.write("  %-8s [%s] %s\n"
+                  % (e["kind"], e["scope"] or "-", e["path"]))
+    out.write("\nDrift detects change, not malice: a legitimate "
+              "update and a tampered skill look identical here. To "
+              "accept this drift as the new normal (human only): "
+              "--skills-baseline --accept\n")
+    return 0
+
+
+def _r9_skill_escalation(payload, cwd, text):
+    """Strict/CI only: raise the FIRST escalatable call after a
+    skill drift one tier, once per distinct drift set. Solo/enforce
+    mode returns the envelope untouched — there, drift is report +
+    audit only."""
+    overlay, mode = _resolve_mode_overlay(cwd)
+    if mode in ("audit", "shadow"):
+        return text
+    if not (mode == "strict" or overlay.get("ci")):
+        return text
+    entries, digest = _skill_drift(cwd)
+    if not entries:
+        return text
+    state = _skill_state(cwd)
+    if state.get("escalated_hash") == digest:
+        return text  # already surfaced once for this exact drift set
+    event = payload.get("hook_event_name") or \
+        payload.get("hookEventName") or ""
+    agent = _agent_for(payload, event)
+    agent_key = agent if agent in ("claude", "gemini", "cursor") \
+        else "claude"
+    decision, reason = _parse_envelope(text, agent_key)
+    tier = _semantic_tier(decision, reason, agent_key)
+    if tier == "deny":
+        return text  # already stopped; don't burn the one escalation
+    new_tier = "ask" if tier == "allow" else "deny"
+    state["escalated_hash"] = digest
+    _skill_state_save(cwd, state)
+    note = (" Skill drift: %d skill/plugin file(s) differ from the "
+            "human baseline and this policy is strict/CI, so the "
+            "first call after the drift is escalated one tier. "
+            "Review with --skills; re-baseline only if the change "
+            "was yours." % len(entries))
+    try:
+        write_audit({"ts": _now(), "event": event,
+                     "session_id": payload.get("session_id") or "",
+                     "cwd": cwd,
+                     "tool_name": payload.get("tool_name") or "",
+                     "rule_id": "seatbelt-skill-drift",
+                     "decision": new_tier,
+                     "outcome": "escalated-first-call",
+                     "from_verdict": tier,
+                     "drift_entries": len(entries)}, cwd)
+    except Exception:
+        pass
+    return _rewrite_envelope(agent_key, new_tier,
+                             (reason or "") + note)
+
+
+# ── Round 9 wrappers ──────────────────────────────────────────────────
+
+_run_hook_r8 = run_hook
+
+#: Hook stdin is agent/host-shaped JSON; anything past this is a
+#: memory/parse DoS against the gate itself, not a tool call.
+MAX_HOOK_INPUT_CHARS = 4 * 1024 * 1024
+
+
+def run_hook_r9(text):
+    import contextlib
+    import io
+    if text and len(text) > MAX_HOOK_INPUT_CHARS:
+        return _deny("hook input exceeds the %d-char cap; failing closed"
+                     % MAX_HOOK_INPUT_CHARS)
+    try:
+        payload = json.loads(text) if text and text.strip() else {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict) or payload.get("hookName"):
+        return _run_hook_r8(text)  # Cline + malformed: r8's contract
+    event = payload.get("hook_event_name") or \
+        payload.get("hookEventName") or ""
+    cwd = payload.get("cwd") or os.getcwd()
+    if event == "SessionStart":
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _run_hook_r8(text)
+        out_text = buf.getvalue()
+        block, _digest = _skill_drift_block(cwd)
+        if block and out_text.strip():
+            try:
+                doc = json.loads(out_text)
+                doc["hookSpecificOutput"]["additionalContext"] += \
+                    " " + block
+                out_text = json.dumps(doc) + "\n"
+            except Exception:
+                pass
+        sys.stdout.write(out_text)
+        return rc
+    if event in ("PreToolUse", "BeforeTool", "preToolUse"):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _run_hook_r8(text)
+        out_text = buf.getvalue()
+        out_text = _r9_skill_escalation(payload, cwd, out_text)
+        out_text = _r9_judge(payload, cwd, out_text)
+        sys.stdout.write(out_text)
+        return rc
+    return _run_hook_r8(text)
+
+
+run_hook = run_hook_r9
+
+_run_doctor_r8 = run_doctor
+
+
+def run_doctor_r9(out=sys.stdout):
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _run_doctor_r8(out=buf)
+    lines = [ln for ln in buf.getvalue().splitlines()
+             if not ln.startswith("DOCTOR:")]
+    cwd = os.getcwd()
+    cfg = _judge_config(cwd)
+    if cfg is None:
+        lines.append("INFO  judge - not configured (opt-in, "
+                     "escalation-only; see docs/JUDGE.md)")
+    else:
+        lines.append("PASS  judge - configured (%s, timeout %d ms); "
+                     "can only escalate, never clear"
+                     % (cfg["command"][:60], cfg["timeout_ms"]))
+    base = _skill_baseline(cwd)
+    if base is None:
+        lines.append("PASS  skills baseline - none yet (create with "
+                     "--skills-baseline)")
+    else:
+        entries, _d = _skill_drift(cwd)
+        lines.append("PASS  skills baseline - %d file(s), drift: %s"
+                     % (len(base.get("files", {})),
+                        ("%d entr(ies)" % len(entries))
+                        if entries else "none"))
+    counted = [ln for ln in lines if ln.startswith(("PASS", "FAIL"))]
+    passed = sum(1 for ln in counted if ln.startswith("PASS"))
+    lines.append("DOCTOR: %d/%d checks passed (seatbelt v%s)"
+                 % (passed, len(counted), VERSION))
+    out.write("\n".join(lines) + "\n")
+    return 0 if all(ln.startswith("PASS") for ln in counted) else 1
+
+
+run_doctor = run_doctor_r9
+
+_main_r8 = main
+
+
+def main_r9(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        # Hook mode: read stdin with the cap applied at read time, so
+        # an oversized payload is denied without being fully loaded.
+        raw = sys.stdin.read(MAX_HOOK_INPUT_CHARS + 1)
+        if len(raw) > MAX_HOOK_INPUT_CHARS:
+            return _deny("hook input exceeds the %d-char cap; "
+                         "failing closed" % MAX_HOOK_INPUT_CHARS)
+        return run_hook(raw)
+    if argv[:1] == ["--doctor"]:
+        return run_doctor_r9()
+    if argv[:1] == ["--skills"]:
+        return run_skills()
+    if argv[:1] == ["--skills-baseline"]:
+        return run_skills_baseline(accept="--accept" in argv[1:])
+    if argv[:1] == ["skills"]:
+        sub = argv[1] if len(argv) > 1 else ""
+        if sub == "baseline":
+            return run_skills_baseline(accept="--accept" in argv[2:])
+        if sub in ("", "check", "status"):
+            return run_skills()
+        sys.stderr.write("usage: seatbelt_hook.py skills "
+                         "[baseline [--accept]|check]\n")
+        return 2
+    return _main_r8(argv)
+
+
+main = main_r9
 
 
 if __name__ == "__main__":

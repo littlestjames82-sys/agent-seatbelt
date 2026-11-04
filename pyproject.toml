@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ghost-seatbelt"
-version = "0.2.0"
+version = "0.3.2"
 description = "Deterministic guardrails for AI coding agents — Seatbelt gates what your agent does before it does it."
 readme = "README.md"
 license = "MIT"
@@ -26,6 +26,9 @@ Homepage = "https://github.com/littlestjames82-sys/agent-seatbelt"
 Repository = "https://github.com/littlestjames82-sys/agent-seatbelt"
 Issues = "https://github.com/littlestjames82-sys/agent-seatbelt/issues"
 Changelog = "https://github.com/littlestjames82-sys/agent-seatbelt/releases"
+
+[tool.hatch.build]
+exclude = [".seatbelt"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_seatbelt"]

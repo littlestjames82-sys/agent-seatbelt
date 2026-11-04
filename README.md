@@ -1,12 +1,5 @@
 # Agent Seatbelt
-
-[![Agent Seatbelt — a seatbelt for AI coding agents](docs/social-preview.png)](https://github.com/littlestjames82-sys/agent-seatbelt)
-
-[![PyPI](https://img.shields.io/pypi/v/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/)
-[![Downloads](https://img.shields.io/pypi/dm/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/littlestjames82-sys/agent-seatbelt)](https://github.com/littlestjames82-sys/agent-seatbelt/releases)
-[![CI](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/littlestjames82-sys/agent-seatbelt)](https://github.com/littlestjames82-sys/agent-seatbelt/releases) [![PyPI](https://img.shields.io/pypi/v/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/) [![Downloads](https://img.shields.io/pypi/dm/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/)
 
 **A seatbelt for AI coding agents.** One self-contained Python file
 that reads every tool call *before* it runs — shell commands, file
@@ -16,8 +9,8 @@ agent-bypass launches, memory poisoning. Every verdict names its
 rule, its blast radius, and the safer path.
 
 ```text
-Seatbelt Bench v1   206/206 cases   ·   GuardFall fuzz 1431/1431
-Naive rm-rf regex    42/206         ·   Injection 15/15, 0 FP
+Seatbelt Bench (0.3.2)   272/272 cases   ·   GuardFall fuzz 1853/1853
+Naive rm-rf regex    56/272         ·   Injection 15/15, 0 FP
 ```
 
 No network. No telemetry. No dependencies. The hook never phones
@@ -94,6 +87,18 @@ policy in your browser: **`docs/playground.html`** (open from disk).
 - **MCP rug-pull watch.** Server configs (env **key names only —
   never values**) and tool surfaces are fingerprinted at baseline;
   drift escalates MCP verdicts until a human re-baselines.
+- **Judge escalation seam (opt-in, off by default).** Point
+  Seatbelt at a local judge command *you* configure: on allow/ask
+  verdicts it may raise the verdict exactly one tier — and it can
+  never lower, clear, or suppress anything. Malformed, slow, or
+  verdict-shaped replies are ignored and audit-logged; the
+  deterministic verdict is always the floor (`docs/JUDGE.md`).
+- **Skill & plugin drift watch.** A human-filed baseline of
+  sha256+size fingerprints (never file contents) for installed
+  skills, commands, hooks, and plugin manifests. Drift is reported
+  at SessionStart and via `--skills`, audit-logged, and — in
+  strict/CI mode only — escalates the first call after the change
+  one tier. Detection, not prevention (`docs/SKILL_DRIFT.md`).
 - **Flight plans.** Declare the session's scope
   (`.seatbelt/plan.json`): ask-tier actions inside it stop
   prompting; denials and locked rules are never covered; off-plan
@@ -157,8 +162,8 @@ separately-credentialed service does on its own.
 ## How it compares (honestly)
 
 - **Single-regex rm blockers** are the common baseline; the bench
-  scores one at 20.4%. They're better than nothing and blind to
-  everything else.
+  scores one at 20.6% on the current 272-case corpus. They're
+  better than nothing and blind to everything else.
 - **Shellter** covers PowerShell/cmd and persistence well; Seatbelt
   matches that ground and adds deobfuscation, snapshots, and the
   memory/injection layers.
@@ -192,11 +197,9 @@ bench is the argument — run your current tool through
 
 ## The Python library
 
-The Python library ships alongside the hook — current release
-**v0.2.0**, published on PyPI as `ghost-seatbelt` (the import package
-stays `agent_seatbelt`): a policy kernel with strictest-wins tiers,
-locked rules, named decisions, human handoff, redacted audit, the
-governor, and a CLI.
+The original 0.1 library remains: `agent_seatbelt` (policy kernel
+with strictest-wins tiers, locked rules, named decisions, human
+handoff, redacted audit), the governor, and a CLI.
 
 ```bash
 pip install ghost-seatbelt
@@ -208,12 +211,13 @@ python3 -m agent_seatbelt --help
 `docs/BENCH.md` (all the numbers) · `docs/DEMO.md` ·
 `docs/INCIDENTS.md` · `docs/THREAT_MODEL.md` · `docs/AGENTS.md` ·
 `docs/SNAPSHOTS.md` · `docs/INJECTION.md` · `docs/BRAIN.md` ·
+`docs/JUDGE.md` · `docs/SKILL_DRIFT.md` ·
 `docs/COMPLIANCE.md` · `docs/TEAM_ADOPTION.md` ·
 `docs/FEED_RUNBOOK.md` · `docs/VERIFICATION.md` ·
 `docs/CLAIMS_AUDIT.md` · `bench/README.md` (score anything)
 
 Slash commands: `/agent-seatbelt:status`, `:report`, `:selftest`,
-`:check`, `:doctor`, `:restore`, `:plan`.
+`:check`, `:doctor`, `:restore`, `:plan`, `:skills`.
 
 MIT licensed. Contributions follow one law — no detector without
 bench cases (destructive AND benign near-miss) and a remediation
@@ -223,3 +227,16 @@ string (`CONTRIBUTING.md`).
 
 From Ghost Developer Studio, the makers of GhostGuard — the
 governance layer for autonomous systems.
+
+---
+<!-- ghost-studio-footer -->
+## More from Ghost Developer Studio
+
+Ghost Developer Studio builds developer tools, AI-agent safety software, and practical apps, and sells by showing working software, not slide decks.
+
+- [Roadmap board](https://github.com/littlestjames82-sys/ghost-roadmaps): where every studio product stands
+- [Agent Seatbelt](https://github.com/littlestjames82-sys/agent-seatbelt): deterministic guardrails for AI coding agents
+- [Ghost Hands](https://github.com/littlestjames82-sys/ghost-hands): governed, recorded, replayable agent hands
+- [GhostSlice](https://github.com/littlestjames82-sys/ghostslice): agent context and prompt optimizer
+- [GhostIDE](https://github.com/littlestjames82-sys/ghostide-android): fully offline AI code editor for Android
+- [All studio projects](https://github.com/littlestjames82-sys?tab=repositories)

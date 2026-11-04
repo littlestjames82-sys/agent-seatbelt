@@ -45,6 +45,10 @@ EFFECT_TIERS = ("deny", "hand_off", "ask", "pre_approved", "allow")
 RESTRICTIVE = {"deny", "ask", "hand_off"}
 FUNCTIONS = {"startsWith", "endsWith", "contains", "matches"}
 
+MAX_MATCHES_PATTERN_CHARS = 200
+MAX_MATCHES_SUBJECT_CHARS = 10000
+_NESTED_QUANTIFIER_RE = re.compile(r"\([^()]*[+*][^()]*\)\s*(?:[+*]|\{)")
+
 
 class PolicySyntaxError(Exception):
     pass
@@ -130,6 +134,15 @@ class _Parser:
         self.toks = toks
         self.src = src
         self.pos = 0
+        self.depth = 0
+
+    def _enter(self):
+        self.depth += 1
+        if self.depth > MAX_EXPRESSION_DEPTH:
+            self.fail(f"expression nested deeper than {MAX_EXPRESSION_DEPTH}")
+
+    def _leave(self):
+        self.depth -= 1
 
     def peek(self):
         return self.toks[self.pos] if self.pos < len(self.toks) else None
@@ -179,7 +192,11 @@ class _Parser:
 
     def parse_unary(self):
         if self.eat_op("!"):
-            return ("not", self.parse_unary())
+            self._enter()
+            try:
+                return ("not", self.parse_unary())
+            finally:
+                self._leave()
         return self.parse_primary()
 
     def parse_primary(self):
@@ -188,18 +205,26 @@ class _Parser:
             self.fail("unexpected end of expression")
         if tok[0] == "op" and tok[1] == "(":
             self.pos += 1
-            inner = self.parse_or()
+            self._enter()
+            try:
+                inner = self.parse_or()
+            finally:
+                self._leave()
             self.expect_op(")")
             return inner
         if tok[0] == "op" and tok[1] == "[":
             self.pos += 1
-            items = []
-            if not self.eat_op("]"):
-                items.append(self.parse_or())
-                while self.eat_op(","):
+            self._enter()
+            try:
+                items = []
+                if not self.eat_op("]"):
                     items.append(self.parse_or())
-                self.expect_op("]")
-            return ("list", items)
+                    while self.eat_op(","):
+                        items.append(self.parse_or())
+                    self.expect_op("]")
+                return ("list", items)
+            finally:
+                self._leave()
         if tok[0] == "str":
             self.pos += 1
             return ("lit", tok[1])
@@ -222,9 +247,13 @@ class _Parser:
                 if word not in FUNCTIONS:
                     self.fail(f'unknown function "{word}" (supported: {", ".join(sorted(FUNCTIONS))})')
                 self.pos += 2
-                args = [self.parse_or()]
-                while self.eat_op(","):
-                    args.append(self.parse_or())
+                self._enter()
+                try:
+                    args = [self.parse_or()]
+                    while self.eat_op(","):
+                        args.append(self.parse_or())
+                finally:
+                    self._leave()
                 self.expect_op(")")
                 if len(args) != 2:
                     self.fail(f'function "{word}" takes exactly 2 arguments')
@@ -241,11 +270,26 @@ class _Parser:
         self.fail("unexpected token")
 
 
+MAX_EXPRESSION_CHARS = 10000
+MAX_EXPRESSION_TOKENS = 1000
+MAX_EXPRESSION_DEPTH = 100
+
+
 def parse_policy_expression(src):
     """Parse one rule expression; raises PolicySyntaxError on any problem."""
     if not isinstance(src, str) or not src.strip():
         raise PolicySyntaxError("rule expression is empty")
-    return _Parser(_tokenize(src), src).parse()
+    if len(src) > MAX_EXPRESSION_CHARS:
+        raise PolicySyntaxError(
+            f"rule expression is too long ({len(src)} chars; cap {MAX_EXPRESSION_CHARS})")
+    toks = _tokenize(src)
+    if len(toks) > MAX_EXPRESSION_TOKENS:
+        raise PolicySyntaxError(
+            f"rule expression has too many tokens ({len(toks)}; cap {MAX_EXPRESSION_TOKENS})")
+    try:
+        return _Parser(toks, src).parse()
+    except RecursionError:
+        raise PolicySyntaxError("rule expression is nested too deeply") from None
 
 
 # ── Evaluation ────────────────────────────────────────────────────────
@@ -354,7 +398,25 @@ def _eval(ast, ctx):
             return first.endswith(second)
         if fn == "contains":
             return second in first
-        # matches
+        # matches — the subject is agent-controlled and the pattern is
+        # policy-controlled; an uncapped pair is a ReDoS/hang surface
+        # (a hung gate is a gate the host kills, i.e. no gate). Cap
+        # both sides and reject the classic catastrophic shape: a
+        # quantified group whose body itself carries a quantifier,
+        # e.g. (a+)+, (a*)*, (\w+)+$.
+        if len(second) > MAX_MATCHES_PATTERN_CHARS:
+            raise PolicyEvalError(
+                f"matches() pattern too long ({len(second)} chars; "
+                f"cap {MAX_MATCHES_PATTERN_CHARS})")
+        if len(first) > MAX_MATCHES_SUBJECT_CHARS:
+            raise PolicyEvalError(
+                f"matches() subject too long ({len(first)} chars; "
+                f"cap {MAX_MATCHES_SUBJECT_CHARS})")
+        if _NESTED_QUANTIFIER_RE.search(second):
+            raise PolicyEvalError(
+                "matches() pattern rejected: nested quantifiers "
+                "(a quantified group containing a quantifier) risk "
+                "catastrophic backtracking")
         try:
             return re.search(second, first) is not None
         except re.error as error:
@@ -435,12 +497,21 @@ def evaluate_policy(policy, ctx):
             try:
                 matched = _truthy(_eval(rule["ast"], ctx))
             except PolicyEvalError as exc:
+                eval_error = exc
+            except RecursionError:
+                # A pathologically deep (but token-capped) expression
+                # must fail closed / inert like any other eval error,
+                # never crash the gate.
+                eval_error = PolicyEvalError("expression evaluation exceeded recursion limits")
+            else:
+                eval_error = None
+            if eval_error is not None:
                 if effect not in RESTRICTIVE:
                     continue  # an erroring permissive rule never grants
                 return {
                     "verdict": "deny",
                     "rule_id": rule["id"],
-                    "reason": f'policy rule "{rule["id"]}" failed to evaluate ({exc}) — failing closed',
+                    "reason": f'policy rule "{rule["id"]}" failed to evaluate ({eval_error}) — failing closed',
                     "handoff_to": None,
                 }
             if matched:

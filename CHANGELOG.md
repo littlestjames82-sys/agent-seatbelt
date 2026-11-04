@@ -4,6 +4,131 @@
 
 (Disaster-feed entries land here first — see docs/FEED_RUNBOOK.md.)
 
+- **Snapshot ids now sort in creation order.** Snapshot consumers
+  (pruning, `--snapshots`) order by directory name, but ids were a
+  second-resolution timestamp plus a random suffix, so two snapshots
+  taken within the same second sorted randomly and the "newest"
+  pick was a coin flip — the cause of the recurring
+  test_restore_reverts_edit_and_is_undoable failures on fast CI
+  runners. The minter now bumps the suffix past the largest one
+  already stored for that second, and claims the snapshot directory
+  atomically so two hooks minting at once cannot collide. Id format
+  is unchanged.
+
+## 0.3.2 — 2026-10-17
+
+Proof release (the 0.3.2 audit cycle). No new features. An external
+review asked what the shipped artifact could prove, so 0.3.2 is the
+0.3.1 tree put through a release-specific security audit, with every
+public number reconciled to a measured run. Full record:
+docs/SECURITY_AUDIT_0.3.2.md and docs/VERIFICATION_0.3.2.md.
+
+- **Adversarial probing**: 232 fresh payloads written against the
+  0.3.1 tree found 42 real bypasses. All 42 are fixed and
+  replay-closed: a project policy overlay can no longer loosen the
+  mode, malformed hook envelopes fail closed, destructive peers
+  (wipefs, blkdiscard, sysrq, find -delete, setuid chmod, userdel,
+  journal vacuum, git checkout discard, cron and systemd
+  persistence writes) are covered, decoder pipelines (printf
+  escapes, ANSI-C quoting, rev, xxd -r, tr ciphers) are judged on
+  their output, interpreter destructive forms and heredoc bodies
+  are scanned, source/. script content is scanned,
+  download-then-execute is caught, and DNS substitution exfil,
+  /dev/tcp secret exfil, rsync/rclone secret sources, kubectl and
+  docker prune tiers, and PowerShell disk tampering are gated.
+- **Bench**: the curated corpus grew from 221 to 272 cases;
+  272/272, false positives 0. GuardFall mutation fuzz 1853/1853.
+  A naive rm-rf regex baseline scores 56/272 (20.6%) on the same
+  corpus. Injection bench 15/15 caught, 0/10 false positives.
+- **Robustness battery**: 10,000/10,000 in-process payloads and
+  300/300 subprocess payloads handled, 0 failures (segmented run,
+  completed October 15, 2026).
+- **Tests**: 379 passed (363 at 0.3.1 plus 16 audit-cycle tests).
+- **Audit log**: described precisely as tamper-evident, not
+  tamper-proof; silent tail truncation is not detectable, and the
+  docs now say so wherever the log is described.
+- **Supply chain**: the sdist no longer ships .seatbelt state
+  files.
+
+## 0.3.1 — 2026-10-11
+
+Hardening release (Round 10). No new features; every change closes a
+demonstrated bypass or crash. Full audit: HARDENING_031.md in the
+project workspace.
+
+- **Pipe-to-shell** now catches path-prefixed and env-wrapped shells
+  (`curl … | /bin/bash`, `curl … | env bash` — both deferred in 0.3.0).
+- **Command substitution inside double quotes** is extracted and
+  judged (the shell executes it there): `bash -c "$(curl …)"`,
+  `echo "$(cat .env)"`, `source <(curl …)`, and interpreter process
+  substitution (`python3 <(curl …)`) now deny instead of deferring.
+  Substitutions in execution position (`eval $(echo rm -rf /)`,
+  `$(echo rm) -rf /`) are judged by their payload.
+- **DNS exfiltration**: nslookup/dig join the network-tool set for
+  the secret+network deny shape.
+- **File writes via shell**: `dd of=`, `cp`/`mv`/`install`
+  destinations are gated like file-tool writes — `dd of=~/.ssh/id_rsa`
+  and `cp /dev/null ~/.ssh/id_rsa` deny.
+- **Self-protection covers the whole `.seatbelt/` state directory**
+  (flight plan, skills baseline, taint, snapshots): an agent can no
+  longer file its own flight plan or re-baseline its own drift
+  watch, via file tools or bash. Reads stay open (transparency).
+- **Secret redaction**: flag-style values (`--api-key VALUE`,
+  `--secret-access-key VALUE`), Stripe/webhook keys, JWTs, and
+  HTTP Basic credentials no longer reach the audit log.
+- **Library fail-closed fixes**: malformed agent action shapes
+  classify as consequential instead of raising; policy expressions
+  are length/token/depth capped and evaluation can no longer escape
+  as RecursionError; `matches()` rejects nested-quantifier patterns
+  and caps pattern/subject size (a 28-char subject hung 0.3.0 for
+  >25 s); policy files are size-capped at load.
+- **Permissions**: audit JSONL, governor JSONL records, snapshot
+  copies, and install.py's settings backup are created owner-only
+  (0600). Hook stdin is capped (oversized payloads deny).
+  install.py refuses non-object settings JSON instead of crashing;
+  `scripts/feed_entry.py` refuses path-traversal `--id`s.
+- New battery `tests/test_round10_hardening.py` (62 tests); bench
+  unchanged at 221/221.
+
+## 0.3.0 — 2026-10-07
+
+The judgment release — two opt-in layers on top of the unchanged
+deterministic rulebook:
+
+- **Judge escalation seam (J1, off by default).** A local command
+  you configure in `.seatbelt/policy.json` (`"judge": {"command":
+  …, "timeout_ms": …}`, env overrides `SEATBELT_JUDGE_COMMAND` /
+  `SEATBELT_JUDGE_TIMEOUT_MS`) is consulted on allow/ask verdicts
+  and may raise a verdict exactly one tier (allow → ask, ask →
+  deny). It can never lower, clear, or suppress a verdict: replies
+  that try are ignored and audit-logged as `clear-attempt`
+  anomalies, as are malformed, crashing, and timed-out replies.
+  The judge never runs on a deny, in audit/shadow mode, on ungated
+  tools, or against a flight plan's deliberate de-escalation.
+  Every invocation lands in the hash-chained audit log under rule
+  id `seatbelt-judge`. Ships with a stdlib keyword example
+  (`examples/judge_example.py`) and the full contract in
+  `docs/JUDGE.md`.
+- **Skill & plugin drift watch (J2).** `--skills-baseline` files a
+  human baseline of sha256+size fingerprints (names and hashes
+  only, never contents) for the installed skill/plugin surface —
+  SKILL.md files, commands, hooks, plugin manifests, project +
+  user scope. SessionStart surfaces new drift; `--skills` prints
+  the full report; drift is audit-logged under
+  `seatbelt-skill-drift` once per distinct drift set. In solo mode
+  drift never blocks anything; in strict/CI mode the first
+  escalatable call after a drift is raised one tier, once.
+  Re-baselining is explicit (`--accept`) and audit-logged; drift
+  never auto-updates the baseline. Limits are stated plainly in
+  `docs/SKILL_DRIFT.md`: this detects change, not malice.
+- Bench grows to 221 cases (15 new: judge escalation semantics +
+  skill drift), still 100% with 0 false positives. New test
+  battery `tests/test_round9.py` (26 tests). A pre-existing flaky
+  test in `tests/test_round5.py` was fixed in the test helper only
+  (newest snapshot chosen by directory creation time, not name —
+  same-second snapshot ids made the old name-sort pick random);
+  no product code changed for it.
+
 ## 0.2.0 — 2026-10-07
 
 The plugin release. Agent Seatbelt becomes a Claude Code plugin with
