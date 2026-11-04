@@ -24,7 +24,7 @@ jobs:
         run: python bench/run_bench.py
       - name: Injection bench
         run: python bench/run_injection.py
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - name: JS policy tests
