@@ -254,8 +254,11 @@ def _envelope_verdict(stdout):
 
 def _run_judge_case(case, td):
     """Round 9 J1: drive the real hook (subprocess) in a temp
-    project whose policy configures a stub judge. The deterministic
-    verdict must stand unless the stub cleanly escalates."""
+    project, with the stub judge configured through the trusted
+    user channel (the temp HOME's ~/.seatbelt/policy.json) — since
+    0.3.5 a project policy can never supply a judge command. The
+    deterministic verdict must stand unless the stub cleanly
+    escalates."""
     import os
     import subprocess
     proj = Path(td) / "proj"
@@ -270,7 +273,11 @@ def _run_judge_case(case, td):
             "command": "%s %s" % (sys.executable, stub),
             "timeout_ms": case.get("judge_timeout_ms", 3000)}}
     (proj / ".seatbelt" / "policy.json").write_text(
-        json.dumps(policy), encoding="utf-8")
+        json.dumps({}), encoding="utf-8")
+    if policy:
+        (home / ".seatbelt").mkdir(parents=True)
+        (home / ".seatbelt" / "policy.json").write_text(
+            json.dumps(policy), encoding="utf-8")
     env = dict(os.environ)
     env.pop("SEATBELT_JUDGE_COMMAND", None)
     env.pop("SEATBELT_JUDGE_TIMEOUT_MS", None)
