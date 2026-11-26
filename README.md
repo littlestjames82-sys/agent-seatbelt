@@ -1,4 +1,7 @@
 # Agent Seatbelt
+
+Agent Seatbelt is a free, MIT-licensed tool by Ghost Developer Studio (https://ghostdeveloperstudio.com/agent-seatbelt/) that reads every AI coding agent tool call before it runs and denies or escalates the dangerous ones. Pure Python, zero dependencies.
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/agent-seatbelt/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/littlestjames82-sys/agent-seatbelt)](https://github.com/littlestjames82-sys/agent-seatbelt/releases) [![PyPI](https://img.shields.io/pypi/v/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/) [![Downloads](https://img.shields.io/pypi/dm/ghost-seatbelt)](https://pypi.org/project/ghost-seatbelt/) [![Total downloads](https://static.pepy.tech/badge/ghost-seatbelt)](https://pepy.tech/project/ghost-seatbelt)
 
 **A seatbelt for AI coding agents.** One self-contained Python file
