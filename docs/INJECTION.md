@@ -48,6 +48,9 @@ This is a heuristic flag, not a proof. Determined attackers can
 phrase around any scorer, and benign text can occasionally trip it —
 that's why a flag *escalates scrutiny* instead of blocking outright,
 and why the false-positive controls matter as much as the catches.
+Tool responses are scanned up to 256 KiB. If that cap is reached, the
+response is tainted as truncated rather than silently treating the
+uninspected remainder as clean. This can flag large benign responses.
 It does not sanitize content, and it cannot see instructions that
 arrive outside tool output (images, audio, files the agent is not
 shown through a hooked tool).

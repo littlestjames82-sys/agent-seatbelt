@@ -4,6 +4,13 @@
 
 (Disaster-feed entries land here first — see docs/FEED_RUNBOOK.md.)
 
+## 0.3.3 — 2026-11-26
+
+Patch release from the independent security review of 0.3.2 (round 12),
+plus the snapshot-id ordering fix that was sitting unreleased on main.
+Both defects were reproduced on the unmodified 0.3.2 tree before adoption,
+and the full test suite (383 tests) passes on the patched tree.
+
 - **Snapshot ids now sort in creation order.** Snapshot consumers
   (pruning, `--snapshots`) order by directory name, but ids were a
   second-resolution timestamp plus a random suffix, so two snapshots
@@ -14,6 +21,17 @@
   already stored for that second, and claims the snapshot directory
   atomically so two hooks minting at once cannot collide. Id format
   is unchanged.
+
+- **Audit-log prefix truncation**: `--verify-log` previously accepted a
+  surviving first record whose `prev_hash` did not point to `GENESIS`
+  (or the legacy prefix marker). It now checks the predecessor on every
+  chained record, including the first, and reports a missing prefix.
+- **Injection response truncation**: PostToolUse scanning previously
+  stopped at 256 KiB and treated an uninspected suffix as clean. A
+  response reaching the cap now raises an injection taint with an
+  `oversized-output-truncated` signal. This is a behavior change: large
+  benign tool responses can now trigger the 30-minute scrutiny window.
+  The response scan budget is also fresh for each response.
 
 ## 0.3.2 — 2026-10-17
 

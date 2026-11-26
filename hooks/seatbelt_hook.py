@@ -54,7 +54,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 GATED_TOOLS = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 VALID_MODES = {"enforce", "audit", "strict", "shadow"}
@@ -2997,9 +2997,12 @@ def run_verify_log(path_arg=None, out=sys.stdout):
             if chained == 0:
                 prev_expected = "LEGACY"
             continue
-        if chained > 0 and row.get("prev_hash") != prev_expected:
+        # The first chained record is anchored too: GENESIS for a new
+        # log, or LEGACY when an older unchained prefix is present. Without
+        # this check, deleting the entire prefix silently verifies.
+        if row.get("prev_hash") != prev_expected:
             out.write("VERIFY-LOG: FAIL at line %d — prev_hash does not match "
-                      "the previous record's hash (chain broken).\n" % i)
+                      "the expected predecessor (chain broken or prefix missing).\n" % i)
             return 1
         rec = {k: v for k, v in row.items() if k != "hash"}
         payload = json.dumps(rec, sort_keys=True, separators=(",", ":"))
@@ -4366,7 +4369,11 @@ def _write_taint(cwd, source, scan):
     return True
 
 
-def _response_text(value, budget=[256 * 1024]):
+def _response_text(value, budget=None):
+    # A fresh budget per response. A mutable default made later scans in
+    # the same process inherit an already-consumed budget.
+    if budget is None:
+        budget = [256 * 1024]
     parts = []
 
     def walk(v):
@@ -4384,6 +4391,19 @@ def _response_text(value, budget=[256 * 1024]):
 
     walk(value)
     return "\n".join(parts)
+
+
+def _scan_tool_response(value, source):
+    """Scan a bounded response. If the cap truncates it, taint anyway:
+    uninspected trailing output must not silently bypass injection review."""
+    text = _response_text(value)
+    scan = injection_scan(text, source)
+    if len(text) >= 256 * 1024:
+        scan["flagged"] = True
+        scan["score"] = max(scan.get("score", 0), INJECTION_FLAG_THRESHOLD)
+        scan["signals"] = sorted(set(scan.get("signals", []) +
+                                     ["oversized-output-truncated"]))
+    return scan
 
 
 _run_hook_r3 = run_hook
@@ -4448,7 +4468,7 @@ def run_hook(raw):
             elif kind == "shell":
                 source = "bash output"
             if source and resp is not None:
-                scan = injection_scan(_response_text(resp), source)
+                scan = _scan_tool_response(resp, source)
                 if scan["flagged"]:
                     _write_taint(cwd, source, scan)
         except Exception:
