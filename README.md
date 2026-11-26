@@ -186,10 +186,16 @@ bench is the argument — run your current tool through
 
 ## Known limits
 
-- Deterministic pattern policy, not a sandbox: a determined
-  adversary with arbitrary code execution can route around any
-  hook. Seatbelt raises the cost of accidents and common attack
-  shapes; it is not a kernel boundary (see `docs/THREAT_MODEL.md`).
+- The legacy hook is deterministic pattern policy, not a sandbox:
+  a determined adversary with arbitrary code execution can route
+  around any hook. Seatbelt raises the cost of accidents and
+  common attack shapes; it is not a kernel boundary (see
+  `docs/THREAT_MODEL.md`). **Broker mode (0.4.0)** is the separate
+  routed-execution surface: commands an integration sends through
+  `seatbelt exec` run under the broker's authorization machine
+  and, on Linux, inside namespace isolation — but the broker
+  governs only execution routed through it, never arbitrary
+  processes (see `docs/BROKER.md`).
 - Snapshots cover enumerable local files only — not databases,
   remote state, or shell-expanded globs.
 - Injection flagging is a heuristic scorer with a measured
@@ -214,7 +220,7 @@ python3 -m agent_seatbelt --help
 `docs/BENCH.md` (all the numbers) · `docs/DEMO.md` ·
 `docs/INCIDENTS.md` · `docs/THREAT_MODEL.md` · `docs/AGENTS.md` ·
 `docs/SNAPSHOTS.md` · `docs/INJECTION.md` · `docs/BRAIN.md` ·
-`docs/JUDGE.md` · `docs/SKILL_DRIFT.md` ·
+`docs/JUDGE.md` · `docs/BROKER.md` · `docs/SKILL_DRIFT.md` ·
 `docs/COMPLIANCE.md` · `docs/TEAM_ADOPTION.md` ·
 `docs/FEED_RUNBOOK.md` · `docs/VERIFICATION.md` ·
 `docs/CLAIMS_AUDIT.md` · `bench/README.md` (score anything)

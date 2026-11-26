@@ -4,6 +4,68 @@
 
 (Disaster-feed entries land here first — see docs/FEED_RUNBOOK.md.)
 
+## 0.4.0 — 2026-11-26
+
+Phases 2–3 of the approved Ghost Execution Broker design: a
+user-level execution broker with an authorization state machine,
+user-only approvals, a hash-chained evidence ledger, and Linux
+namespace isolation for routed execution. Legacy hook behavior is
+unchanged apart from a broker section in `--doctor`.
+
+- **Ghost Execution Broker (`seatbelt-broker`).** A stdlib-only
+  daemon on a Unix socket (SO_PEERCRED peer-uid check + per-session
+  tokens, session isolation, idle expiry). Execution requests
+  follow an 11-state authorization machine (RECEIVED … COMPLETED,
+  DENIED / FAILED / TERMINATED); replayed or mutated requests are
+  refused, and malformed input never advances state.
+- **Authorization reuses the existing policy engine** — the same
+  deterministic rulebook, mode overlays, and 0.3.5 judge trust
+  rules (judges may escalate only). `ask` verdicts park in
+  AWAITING_APPROVAL: only the user can approve, via a capability
+  token at `~/.seatbelt/broker.approval-token` that agent sessions
+  never hold. Approvals are single-use and bound to the exact
+  request hash.
+- **Evidence ledger.** Every transition is appended to a
+  hash-chained ledger at `~/.seatbelt/ledger.jsonl` — user home,
+  never the project tree — with monotonic sequence numbers across
+  broker runs. `seatbelt verify-ledger` verifies the chain,
+  including prefix-deletion detection, consistent with
+  `--verify-log`.
+- **Linux runtime isolation.** Routed execution runs in
+  unprivileged user/mount/pid namespaces (plus a network namespace
+  for profile `none`) via a ctypes launcher — no external
+  dependencies, no bwrap requirement. Filesystem profiles
+  (read-only / workspace-write / temporary / extended) are capped
+  by user config; the always-denied list (`~/.ssh`, cloud
+  credentials, browser profiles, `~/.seatbelt`, …) is masked by
+  the mount view; the real home is never bound. rlimits (CPU,
+  address space, file size, open files, processes) plus a
+  broker-enforced wall clock kill the whole namespace on timeout;
+  detached children die with the pid namespace. cgroup v2 limits
+  apply only when a delegated writable subtree exists — results
+  and ledger events name the mechanism that actually applied.
+- **Policy-only mode, labeled.** Where namespaces are unavailable
+  the broker can run authorization-only, and says so in its
+  status, every result, the ledger, and `--doctor`. Configured
+  isolation that is unavailable makes the broker refuse to start
+  rather than silently downgrade.
+- **Crash safety.** A broker killed mid-execution leaves no
+  execution behind: clients fail closed (never fall back to direct
+  execution), and the next broker start reaps orphaned sandboxes
+  and appends FAILED transitions for interrupted requests.
+- **Client + CLI.** `seatbelt exec` routes a command through the
+  broker and propagates its exit code (2 = denied, 3 = broker
+  unavailable / failed / terminated); `seatbelt approve|deny|
+  pending|broker-status|verify-ledger` cover the user side.
+  Output is tail-capped (256 KiB/stream) and secret-redacted with
+  the existing patterns before it is returned.
+- **Network profiles are `none` | `host` only.** `host` requires
+  a user config grant. There is no hostname allowlist proxy in
+  0.4.0 (0.5.0 scope); nothing claims per-host filtering.
+- **Scope honesty.** The broker governs only execution routed
+  through it (`seatbelt exec`, the client API, wrappers). It does
+  not claim to contain arbitrary processes. See `docs/BROKER.md`.
+
 ## 0.3.5 — 2026-11-26
 
 Security release (round-14 finding F-14-01, Phase 1 of the approved

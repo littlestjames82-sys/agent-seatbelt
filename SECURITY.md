@@ -24,6 +24,17 @@ misses by name.
 - The audit log is hash-chained for tamper evidence (`--verify-log`),
   and records are redacted (secret type + length, never values) and
   sanitized (ANSI/control stripped) before they are written.
+- Broker mode (0.4.0) is a separate execution surface with its own
+  evidence ledger (`~/.seatbelt/ledger.jsonl`, `seatbelt
+  verify-ledger`). The distinction that matters: the legacy hook
+  **intercepts** tool calls and executes nothing itself, while the
+  broker **executes** commands routed through it — under its
+  authorization machine and, on Linux, namespace isolation. The
+  broker governs only routed execution; it is not a claim about
+  arbitrary processes on the machine. Its approval capability
+  token (`~/.seatbelt/broker.approval-token`, mode 0600) is a
+  credential: anyone who can read it can approve broker requests.
+  See `docs/BROKER.md`.
 - Snapshots under `.seatbelt/snapshots/` are local pre-action copies,
   not backups: they share fate with the disk they sit on.
 - Known limits are documented in `docs/THREAT_MODEL.md`. The honest

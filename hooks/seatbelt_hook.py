@@ -54,7 +54,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.3.5"
+VERSION = "0.4.0"
 GATED_TOOLS = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 VALID_MODES = {"enforce", "audit", "strict", "shadow"}
@@ -7096,6 +7096,7 @@ def run_doctor_r9(out=sys.stdout):
         lines.append("INFO  judge - project proposes a judge command "
                      "(NOT trusted, never run; to use it, register "
                      "it: --register-judge)")
+    lines.append(_doctor_broker_line())
     base = _skill_baseline(cwd)
     if base is None:
         lines.append("PASS  skills baseline - none yet (create with "
@@ -7115,6 +7116,47 @@ def run_doctor_r9(out=sys.stdout):
 
 
 run_doctor = run_doctor_r9
+
+
+def _doctor_broker_line():
+    """Broker-mode status for --doctor (0.4.0). The hook stays
+    standalone and network-free (no package import, no socket):
+    the broker records its status in ~/.seatbelt/broker-status.json
+    while it runs, and this line reads that file and checks the
+    recorded pid is alive. Legacy hook mode makes no isolation
+    claims; this line reports whether the broker (the
+    routed-execution surface) is up, and in which mode."""
+    home = os.environ.get("SEATBELT_HOME") or str(
+        Path.home() / ".seatbelt")
+    status_path = os.path.join(home, "broker-status.json")
+    if not os.path.exists(status_path):
+        return ("INFO  broker - not running (broker mode "
+                "unavailable; this hook is legacy interception "
+                "mode and makes no isolation claims)")
+    try:
+        with open(status_path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        pid = int(doc.get("pid") or 0)
+        alive = False
+        if pid > 0:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except PermissionError:
+                alive = True
+            except OSError:
+                alive = False
+        if alive:
+            return ("PASS  broker - running (pid %d), mode: %s "
+                    "(broker mode governs routed execution only; "
+                    "see docs/BROKER.md)"
+                    % (pid, doc.get("mode", "?")))
+        return ("INFO  broker - status file is stale (pid %d not "
+                "running); broker mode unavailable, legacy hook "
+                "mode only)" % pid)
+    except Exception:
+        return ("INFO  broker - status file unreadable (broker "
+                "mode unverified; legacy hook mode only)")
 
 
 def run_register_judge(argv, out=sys.stdout):
