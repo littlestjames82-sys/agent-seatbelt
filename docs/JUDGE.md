@@ -54,26 +54,67 @@ The judge never runs:
 
 ## Configuring a judge
 
-In the project policy, `.seatbelt/policy.json`:
+A judge command is code that runs with **your** permissions, so it
+can only ever be configured by **you** — never by a project. Before
+0.3.5 the command was read from the project's `.seatbelt/policy.json`,
+which meant a cloned repository could run code on the back of a
+harmless allow verdict (round-14 finding F-14-01). That path is
+closed. A judge command now comes from exactly three trusted
+sources, in this order:
 
-```json
-{"judge": {"command": "python3 /path/to/my_judge.py",
-           "timeout_ms": 3000}}
+1. **Environment** — `SEATBELT_JUDGE_COMMAND` (with
+   `SEATBELT_JUDGE_TIMEOUT_MS` for the timeout).
+2. **Your own policy file** — `~/.seatbelt/policy.json`:
+
+   ```json
+   {"judge": {"command": "python3 /path/to/my_judge.py",
+              "timeout_ms": 3000}}
+   ```
+3. **The judge registry** — `~/.seatbelt/judges.json`, referenced
+   *by name* from either policy file (see below).
+
+What a **project's** `.seatbelt/policy.json` may do with the judge —
+and nothing more:
+
+- `"judge": {"enabled": false}` — switch the seam off for this
+  project.
+- `"judge": {"name": "deploys"}` — *propose* a judge by name. The
+  name resolves only against **your** registry; if you never
+  registered it, nothing runs and the proposal is audit-logged as
+  `judge-not-registered`.
+- `"judge": {"command": "..."}` — **never executed.** The proposal
+  is written to the audit log (`untrusted-project-judge`) and shown
+  by `--doctor`, so you can see what a repo *wanted* to run — and
+  register it yourself if you actually trust it.
+
+### The registry: hash-pinned judges
+
+Register a judge executable once, under a name:
+
+```
+seatbelt_hook.py --register-judge deploys --exec /usr/bin/python3 \
+    --arg /path/to/my_judge.py --timeout-ms 3000
+seatbelt_hook.py --judges        # list registered judges
 ```
 
-Environment overrides (they win over the file):
+Registration records the executable's **sha256** in
+`~/.seatbelt/judges.json`. Before *every* run of a registry judge,
+the hook re-hashes the executable and refuses to run it on a
+mismatch (`hash-mismatch` in the audit log) — a swapped or edited
+binary never executes. Registry judges run without a shell, as an
+argv array. An entry without a sha256 pin is treated as untrusted
+and never runs.
 
-- `SEATBELT_JUDGE_COMMAND`
-- `SEATBELT_JUDGE_TIMEOUT_MS`
+The timeout defaults to 3000 ms and is clamped to 100–30000 ms; it
+is taken from the environment or the trusted source (your policy /
+the registry entry) — never from the project file. Keep judge
+timeout + normal hook time inside your agent host's hook timeout
+(5 s in the shipped Claude Code config) — a judge that eats the
+whole budget gets cut off by the host, and the deterministic
+verdict stands anyway.
 
-Set `"enabled": false` in the policy to switch a configured judge
-off without deleting it. The timeout defaults to 3000 ms and is
-clamped to 100–30000 ms. Keep judge timeout + normal hook time
-inside your agent host's hook timeout (5 s in the shipped Claude
-Code config) — a judge that eats the whole budget gets cut off by
-the host, and the deterministic verdict stands anyway.
-
-`--doctor` reports whether a judge is configured.
+`--doctor` reports whether a judge is configured, its source, and
+any judge command a project is proposing (marked NOT trusted).
 
 ## The contract
 
@@ -131,11 +172,13 @@ timeout, it works.
 - The seam applies to the **hook**. The Python library Governor is
   unchanged: if you embed the library, your own code is the judge.
 - A judge runs with **your** user's permissions, as a command **you**
-  configured. Seatbelt treats it as trusted configuration, the same
-  way it treats your policy file — the escalation-only contract
-  bounds what it can do to *verdicts*, not what your own command
-  does on your own machine. Don't point the config at code you
-  wouldn't run yourself.
+  configured — in your environment, your `~/.seatbelt/policy.json`,
+  or your hash-pinned registry. Project configuration is untrusted
+  input: it can disable the seam or propose a judge by name, but it
+  can never supply code to run. The escalation-only contract bounds
+  what a judge can do to *verdicts*, not what your own command does
+  on your own machine — so don't configure a judge you wouldn't run
+  yourself.
 - Judge latency is real latency: every gated allow/ask call waits
   for the judge (up to the timeout). With no judge configured, the
-  seam costs one small policy-file read and nothing else.
+  seam costs a couple of small file reads and nothing else.

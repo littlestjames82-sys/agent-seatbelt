@@ -54,7 +54,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.3.3"
+VERSION = "0.3.5"
 GATED_TOOLS = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 VALID_MODES = {"enforce", "audit", "strict", "shadow"}
@@ -4369,40 +4369,63 @@ def _write_taint(cwd, source, scan):
     return True
 
 
-def _response_text(value, budget=None):
-    # A fresh budget per response. A mutable default made later scans in
-    # the same process inherit an already-consumed budget.
+def _response_text(value, budget=None, truncated=None):
+    # A fresh budget per response. Track structural truncation too: the
+    # old 50-item list cap could silently skip an injection in item 51.
+    # Depth/node caps bound hostile nested structures without recursion DoS.
     if budget is None:
         budget = [256 * 1024]
+    if truncated is None:
+        truncated = [False]
     parts = []
+    nodes = [0]
+    max_nodes, max_depth = 10000, 64
 
-    def walk(v):
+    def walk(v, depth=0):
         if budget[0] <= 0:
+            truncated[0] = True
+            return
+        nodes[0] += 1
+        if nodes[0] > max_nodes or depth > max_depth:
+            truncated[0] = True
             return
         if isinstance(v, str):
-            parts.append(v[:budget[0]])
-            budget[0] -= len(v)
+            take = min(len(v), budget[0])
+            parts.append(v[:take])
+            budget[0] -= take
+            if take < len(v):
+                truncated[0] = True
         elif isinstance(v, dict):
             for x in v.values():
-                walk(x)
-        elif isinstance(v, list):
+                if budget[0] <= 0 or nodes[0] >= max_nodes:
+                    truncated[0] = True
+                    break
+                walk(x, depth + 1)
+        elif isinstance(v, (list, tuple)):
+            if len(v) > 50:
+                truncated[0] = True
             for x in v[:50]:
-                walk(x)
+                if budget[0] <= 0 or nodes[0] >= max_nodes:
+                    truncated[0] = True
+                    break
+                walk(x, depth + 1)
 
     walk(value)
     return "\n".join(parts)
 
 
 def _scan_tool_response(value, source):
-    """Scan a bounded response. If the cap truncates it, taint anyway:
-    uninspected trailing output must not silently bypass injection review."""
-    text = _response_text(value)
+    """Scan a bounded response. Any uninspected content taints the result:
+    omitted structure or text must not silently bypass injection review."""
+    truncated = [False]
+    text = _response_text(value, truncated=truncated)
     scan = injection_scan(text, source)
-    if len(text) >= 256 * 1024:
+    if truncated[0] or len(text) >= 256 * 1024:
         scan["flagged"] = True
         scan["score"] = max(scan.get("score", 0), INJECTION_FLAG_THRESHOLD)
-        scan["signals"] = sorted(set(scan.get("signals", []) +
-                                     ["oversized-output-truncated"]))
+        signal = ("oversized-output-truncated" if len(text) >= 256 * 1024
+                  else "response-structure-truncated")
+        scan["signals"] = sorted(set(scan.get("signals", []) + [signal]))
     return scan
 
 
@@ -6338,8 +6361,11 @@ REMEDIATIONS.update({
     "seatbelt-judge": "A configured judge raised this verdict one tier. "
                       "The judge can only ever make Seatbelt stricter; "
                       "if the escalation is wrong, fix or disable the "
-                      "judge in .seatbelt/policy.json — the "
-                      "deterministic verdict underneath is unchanged.",
+                      "judge in YOUR OWN config — ~/.seatbelt/policy.json "
+                      "or the judge registry in ~/.seatbelt/judges.json. "
+                      "A project's policy file can never supply a judge "
+                      "command. The deterministic verdict underneath is "
+                      "unchanged.",
     "seatbelt-skill-drift": "Skill/plugin files differ from the human "
                             "baseline. Review with --skills; if the "
                             "change was yours, re-baseline with "
@@ -6366,51 +6392,166 @@ _JUDGE_CLEAR_KEYS = ("decision", "verdict", "allow", "clear",
                      "suppress", "override", "permissionDecision")
 
 
-def _judge_config(cwd):
-    """The configured judge, or None. Config follows the policy-file
-    pattern: .seatbelt/policy.json -> "judge": {"command": ...,
-    "timeout_ms": ...}; SEATBELT_JUDGE_COMMAND /
-    SEATBELT_JUDGE_TIMEOUT_MS override it. No command = no judge:
-    the seam then costs one small file read and nothing else."""
-    cfg = {}
+def _policy_judge(path):
+    """The "judge" object from a policy file, or {}."""
     try:
-        doc = json.loads((Path(cwd) / ".seatbelt" / "policy.json")
-                         .read_text(encoding="utf-8"))
+        doc = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(doc, dict) and isinstance(doc.get("judge"), dict):
-            cfg = doc["judge"]
+            return doc["judge"]
     except Exception:
-        cfg = {}
-    env_cmd = os.environ.get("SEATBELT_JUDGE_COMMAND", "")
-    if cfg.get("enabled") is False and not env_cmd.strip():
-        return None
-    command = env_cmd.strip() or cfg.get("command")
-    if not isinstance(command, str) or not command.strip():
-        return None
-    raw_timeout = os.environ.get("SEATBELT_JUDGE_TIMEOUT_MS") or \
-        cfg.get("timeout_ms", 3000)
+        pass
+    return {}
+
+
+def _user_policy_path():
+    return Path.home() / ".seatbelt" / "policy.json"
+
+
+def _judge_registry_path():
+    return Path.home() / ".seatbelt" / "judges.json"
+
+
+def _judge_registry():
+    """Registered judges from ~/.seatbelt/judges.json: entries of
+    {"id", "executable", "args", "sha256", "timeout_ms"}. Accepts
+    {"judges": [...]} or a bare top-level list."""
     try:
-        timeout_ms = int(raw_timeout)
+        doc = json.loads(_judge_registry_path().read_text(
+            encoding="utf-8"))
     except Exception:
-        timeout_ms = 3000
-    timeout_ms = max(100, min(timeout_ms, 30000))
-    return {"command": command.strip(), "timeout_ms": timeout_ms}
+        return []
+    if isinstance(doc, dict):
+        doc = doc.get("judges")
+    if not isinstance(doc, list):
+        return []
+    return [e for e in doc if isinstance(e, dict) and e.get("id")]
+
+
+def _judge_config(cwd):
+    """(cfg, proposal): the TRUSTED judge configuration (or None) and
+    what the PROJECT asked for (audit/doctor surface only — a project
+    proposal is NEVER executed).
+
+    Trust boundary (0.3.5; design 0.4.0 section 4): a judge command
+    is code that runs with the user's permissions, so it may only
+    come from the user — SEATBELT_JUDGE_COMMAND, the user's own
+    ~/.seatbelt/policy.json, or the hash-pinned registry
+    ~/.seatbelt/judges.json, referenced by name. The PROJECT's
+    .seatbelt/policy.json can switch the seam off
+    ("judge": {"enabled": false}) or PROPOSE a judge by command or
+    name; a proposed command is logged and shown by --doctor but
+    never run, and a proposed name resolves only against the user's
+    own registry. Timeouts likewise come only from the env or the
+    trusted source, never from the project file."""
+    pjudge = _policy_judge(Path(cwd) / ".seatbelt" / "policy.json")
+    ujudge = _policy_judge(_user_policy_path())
+
+    proposal = None
+    if isinstance(pjudge.get("command"), str) \
+            and pjudge["command"].strip():
+        proposal = {"kind": "command",
+                    "command": pjudge["command"].strip()}
+    elif isinstance(pjudge.get("name"), str) and pjudge["name"].strip():
+        proposal = {"kind": "name", "name": pjudge["name"].strip()}
+
+    env_cmd = os.environ.get("SEATBELT_JUDGE_COMMAND", "").strip()
+    if not env_cmd and (pjudge.get("enabled") is False
+                        or ujudge.get("enabled") is False):
+        return None, proposal
+
+    env_timeout = os.environ.get("SEATBELT_JUDGE_TIMEOUT_MS")
+
+    def timeout_for(trusted_timeout):
+        raw = env_timeout or trusted_timeout or 3000
+        try:
+            value = int(raw)
+        except Exception:
+            value = 3000
+        return max(100, min(value, 30000))
+
+    # (a) Environment: the user speaking directly.
+    if env_cmd:
+        return {"kind": "command", "command": env_cmd, "source": "env",
+                "timeout_ms": timeout_for(ujudge.get("timeout_ms"))}, \
+            proposal
+    # (b) The user's own policy file.
+    ucmd = ujudge.get("command")
+    if isinstance(ucmd, str) and ucmd.strip():
+        return {"kind": "command", "command": ucmd.strip(),
+                "source": "user",
+                "timeout_ms": timeout_for(ujudge.get("timeout_ms"))}, \
+            proposal
+    # (c) A name — from the user's policy (trusted) or the project's
+    # (a mere proposal) — resolving ONLY to an executable the user
+    # registered and pinned by sha256.
+    name = None
+    for cand in (ujudge.get("name"), pjudge.get("name")):
+        if isinstance(cand, str) and cand.strip():
+            name = cand.strip()
+            break
+    if name:
+        if proposal is None:
+            proposal = {"kind": "name", "name": name}
+        for entry in _judge_registry():
+            if entry.get("id") != name:
+                continue
+            sha = entry.get("sha256")
+            exe = entry.get("executable")
+            if not (isinstance(sha, str) and sha.strip()
+                    and isinstance(exe, str) and exe.strip()):
+                return None, proposal  # unpinned = untrusted
+            args = entry.get("args")
+            if not isinstance(args, list):
+                args = []
+            argv = [exe.strip()] + [str(a) for a in args]
+            return {"kind": "argv", "argv": argv,
+                    "executable": exe.strip(), "sha256": sha.strip(),
+                    "command": " ".join(argv), "source": "registry",
+                    "timeout_ms": timeout_for(
+                        entry.get("timeout_ms"))}, proposal
+        return None, proposal  # name not in the user's registry
+    return None, proposal
 
 
 def _judge_invoke(cfg, brief):
     """Run the judge once. Returns (outcome, judge_reason) with
     outcome in escalated | no-raise | timeout | crash | malformed |
-    clear-attempt. Only 'escalated' may change a verdict, and only
-    ever one tier up — enforced here and by the caller, never
-    trusted to the judge's own output."""
-    try:
-        proc = subprocess.run(cfg["command"], shell=True,
-                              input=json.dumps(brief),
-                              capture_output=True, text=True,
-                              timeout=cfg["timeout_ms"] / 1000.0)
-    except subprocess.TimeoutExpired:
-        return "timeout", ""
-    except Exception:
-        return "crash", ""
+    clear-attempt | hash-mismatch. Only 'escalated' may change a
+    verdict, and only ever one tier up — enforced here and by the
+    caller, never trusted to the judge's own output.
+
+    Registry judges (kind "argv") are hash-pinned: the executable's
+    bytes are verified against the registered sha256 BEFORE every
+    run — a swapped binary is never executed — and they run without
+    a shell. Command judges (env / user policy) keep the shell path:
+    that command string is the user's own configuration."""
+    if cfg.get("kind") == "argv":
+        try:
+            digest = hashlib.sha256(
+                Path(cfg["executable"]).read_bytes()).hexdigest()
+        except Exception:
+            return "hash-mismatch", ""
+        if digest.lower() != str(cfg.get("sha256", "")).lower():
+            return "hash-mismatch", ""
+        try:
+            proc = subprocess.run(cfg["argv"], shell=False,
+                                  input=json.dumps(brief),
+                                  capture_output=True, text=True,
+                                  timeout=cfg["timeout_ms"] / 1000.0)
+        except subprocess.TimeoutExpired:
+            return "timeout", ""
+        except Exception:
+            return "crash", ""
+    else:
+        try:
+            proc = subprocess.run(cfg["command"], shell=True,
+                                  input=json.dumps(brief),
+                                  capture_output=True, text=True,
+                                  timeout=cfg["timeout_ms"] / 1000.0)
+        except subprocess.TimeoutExpired:
+            return "timeout", ""
+        except Exception:
+            return "crash", ""
     if proc.returncode != 0:
         return "crash", ""
     try:
@@ -6491,11 +6632,33 @@ def _r9_judge(payload, cwd, text):
     _overlay9, mode = _resolve_mode_overlay(cwd)
     if mode in ("audit", "shadow"):
         return text  # observe-only modes emit nothing to escalate
-    cfg = _judge_config(cwd)
-    if cfg is None:
+    cfg, proposal = _judge_config(cwd)
+    if cfg is None and proposal is None:
         return text
     record, plan_covered = _judge_eval_record(cwd, session_id, tool_name)
     if record is None or plan_covered:
+        return text
+    if cfg is None:
+        # No TRUSTED judge is configured, but the project proposed
+        # one. Surface it in the audit log — and NEVER run it: a
+        # cloned repo must not execute code on the back of a
+        # harmless allow verdict (round-14 finding F-14-01).
+        if proposal.get("kind") == "command":
+            outcome = "untrusted-project-judge"
+            proposed = proposal.get("command", "")
+        else:
+            outcome = "judge-not-registered"
+            proposed = ""
+        try:
+            write_audit({"ts": _now(), "event": event,
+                         "session_id": session_id, "cwd": cwd,
+                         "tool_name": tool_name,
+                         "rule_id": "seatbelt-judge",
+                         "judge_outcome": outcome,
+                         "from_verdict": tier, "decision": tier,
+                         "command": proposed[:120]}, cwd)
+        except Exception:
+            pass
         return text
     brief = {
         "tool": tool_name,
@@ -6920,14 +7083,19 @@ def run_doctor_r9(out=sys.stdout):
     lines = [ln for ln in buf.getvalue().splitlines()
              if not ln.startswith("DOCTOR:")]
     cwd = os.getcwd()
-    cfg = _judge_config(cwd)
+    cfg, proposal = _judge_config(cwd)
     if cfg is None:
         lines.append("INFO  judge - not configured (opt-in, "
                      "escalation-only; see docs/JUDGE.md)")
     else:
-        lines.append("PASS  judge - configured (%s, timeout %d ms); "
-                     "can only escalate, never clear"
-                     % (cfg["command"][:60], cfg["timeout_ms"]))
+        lines.append("PASS  judge - configured (%s, source: %s, "
+                     "timeout %d ms); can only escalate, never clear"
+                     % (cfg["command"][:60], cfg.get("source", "?"),
+                        cfg["timeout_ms"]))
+    if proposal and proposal.get("kind") == "command":
+        lines.append("INFO  judge - project proposes a judge command "
+                     "(NOT trusted, never run; to use it, register "
+                     "it: --register-judge)")
     base = _skill_baseline(cwd)
     if base is None:
         lines.append("PASS  skills baseline - none yet (create with "
@@ -6948,6 +7116,82 @@ def run_doctor_r9(out=sys.stdout):
 
 run_doctor = run_doctor_r9
 
+
+def run_register_judge(argv, out=sys.stdout):
+    """--register-judge ID --exec PATH [--arg VALUE]... [--timeout-ms N]
+
+    Pin a judge executable in the USER's registry
+    (~/.seatbelt/judges.json) by the sha256 of its bytes. Only a
+    registered, hash-pinned judge can be referenced by name from a
+    policy file — and the hash is re-verified before every run."""
+    judge_id = argv[0] if argv else ""
+    rest = argv[1:] if len(argv) > 1 else []
+    exe = None
+    args = []
+    timeout_ms = None
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in ("--exec", "--arg", "--timeout-ms") \
+                and i + 1 < len(rest):
+            if tok == "--exec":
+                exe = rest[i + 1]
+            elif tok == "--arg":
+                args.append(rest[i + 1])
+            else:
+                try:
+                    timeout_ms = int(rest[i + 1])
+                except Exception:
+                    timeout_ms = None
+            i += 2
+        else:
+            out.write("usage: seatbelt_hook.py --register-judge ID "
+                      "--exec PATH [--arg VALUE]... [--timeout-ms N]\n")
+            return 2
+    if not judge_id or not exe:
+        out.write("usage: seatbelt_hook.py --register-judge ID "
+                  "--exec PATH [--arg VALUE]... [--timeout-ms N]\n")
+        return 2
+    try:
+        digest = hashlib.sha256(Path(exe).read_bytes()).hexdigest()
+    except OSError as exc:
+        out.write("Could not read judge executable %s: %s\n" % (exe, exc))
+        return 1
+    entry = {"id": judge_id, "executable": exe, "args": args,
+             "sha256": digest}
+    if timeout_ms is not None:
+        entry["timeout_ms"] = max(100, min(timeout_ms, 30000))
+    entries = [e for e in _judge_registry() if e.get("id") != judge_id]
+    entries.append(entry)
+    path = _judge_registry_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"judges": entries}, indent=1),
+                        encoding="utf-8")
+    except OSError as exc:
+        out.write("Could not write %s: %s\n" % (path, exc))
+        return 1
+    out.write("Registered judge '%s': %s (sha256 %s...)\n"
+              % (judge_id, exe, digest[:12]))
+    return 0
+
+
+def run_judges(out=sys.stdout):
+    """--judges: list the user's registered (hash-pinned) judges."""
+    entries = _judge_registry()
+    if not entries:
+        out.write("No judges registered (%s). Register one with "
+                  "--register-judge ID --exec PATH.\n"
+                  % _judge_registry_path())
+        return 0
+    for e in entries:
+        out.write("%s  %s  sha256 %s...  timeout %s ms\n"
+                  % (e.get("id"), e.get("executable"),
+                     str(e.get("sha256", ""))[:12],
+                     e.get("timeout_ms", 3000)))
+    return 0
+
+
 _main_r8 = main
 
 
@@ -6963,6 +7207,10 @@ def main_r9(argv=None):
         return run_hook(raw)
     if argv[:1] == ["--doctor"]:
         return run_doctor_r9()
+    if argv[:1] == ["--register-judge"]:
+        return run_register_judge(argv[1:])
+    if argv[:1] == ["--judges"]:
+        return run_judges()
     if argv[:1] == ["--skills"]:
         return run_skills()
     if argv[:1] == ["--skills-baseline"]:

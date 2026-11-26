@@ -14,13 +14,19 @@ runs:
   steps:
     - name: Seatbelt static scan
       shell: bash
+      env:
+        # Keep caller-controlled input in the environment; never splice it
+        # into generated shell source. `files` remains space-separated.
+        SEATBELT_FILES: ${{ inputs.files }}
+        SEATBELT_HOOK: ${{ github.action_path }}/hooks/seatbelt_hook.py
       run: |
         status=0
-        for f in ${{ inputs.files }}; do
+        read -r -a files <<< "$SEATBELT_FILES"
+        for f in "${files[@]}"; do
           echo "== $f"
           # --check-file exits 1 when a deny-tier line is found,
           # 2 when the file cannot be read — both fail the job.
-          python3 "${{ github.action_path }}/hooks/seatbelt_hook.py" --check-file "$f" || status=1
+          python3 "$SEATBELT_HOOK" --check-file "$f" || status=1
         done
         exit $status
 branding:

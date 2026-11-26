@@ -90,6 +90,15 @@ def set_policy(tmp, doc):
     (seat / "policy.json").write_text(json.dumps(doc), encoding="utf-8")
 
 
+def set_user_policy(home, doc):
+    """The USER's own policy (~/.seatbelt/policy.json). Since 0.3.5 a
+    judge command is trusted only from here (or the env / registry) —
+    never from the project policy above."""
+    seat = Path(home) / ".seatbelt"
+    seat.mkdir(parents=True, exist_ok=True)
+    (seat / "policy.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
 ESCALATE = ("import json, sys\n"
             "json.load(sys.stdin)\n"
             "print(json.dumps({'escalate': True,"
@@ -127,7 +136,7 @@ def test_judge_off_by_default(tmp_path, home):
 
 
 def test_judge_escalates_allow_to_ask(tmp_path, home):
-    set_policy(tmp_path, {"judge": {
+    set_user_policy(home, {"judge": {
         "command": make_judge(tmp_path, ESCALATE), "timeout_ms": 3000}})
     proc = drive(pretool("git status"), tmp_path, {"HOME": str(home)})
     assert decision_of(proc) == "ask"
@@ -141,7 +150,7 @@ def test_judge_escalates_allow_to_ask(tmp_path, home):
 
 
 def test_judge_escalates_ask_to_deny(tmp_path, home):
-    set_policy(tmp_path, {"judge": {
+    set_user_policy(home, {"judge": {
         "command": make_judge(tmp_path, ESCALATE)}})
     proc = drive(pretool("rm old.log"), tmp_path, {"HOME": str(home)})
     assert decision_of(proc) == "deny"
@@ -151,7 +160,7 @@ def test_judge_escalates_ask_to_deny(tmp_path, home):
 def test_judge_never_runs_on_deny(tmp_path, home):
     cmd, marker = marker_judge(tmp_path, {"escalate": True,
                                           "reason": "x"})
-    set_policy(tmp_path, {"judge": {"command": cmd}})
+    set_user_policy(home, {"judge": {"command": cmd}})
     proc = drive(pretool("rm -rf /"), tmp_path, {"HOME": str(home)})
     assert decision_of(proc) == "deny"
     assert not marker.exists()  # the judge was never even invoked
@@ -161,7 +170,7 @@ def test_judge_never_runs_on_deny(tmp_path, home):
 def test_judge_clear_attempt_ignored(tmp_path, home):
     cmd, _m = marker_judge(tmp_path, {"decision": "allow",
                                       "escalate": False})
-    set_policy(tmp_path, {"judge": {"command": cmd}})
+    set_user_policy(home, {"judge": {"command": cmd}})
     proc = drive(pretool("rm old.log"), tmp_path, {"HOME": str(home)})
     assert decision_of(proc) == "ask"  # unchanged
     assert "Judge raised" not in reason_of(proc)
@@ -173,7 +182,7 @@ def test_judge_verdict_keys_void_reply_even_with_escalate(tmp_path, home):
     cmd, _m = marker_judge(tmp_path, {"escalate": True,
                                       "decision": "deny",
                                       "reason": "sneaky"})
-    set_policy(tmp_path, {"judge": {"command": cmd}})
+    set_user_policy(home, {"judge": {"command": cmd}})
     proc = drive(pretool("git status"), tmp_path, {"HOME": str(home)})
     assert decision_of(proc) == "allow"  # whole reply ignored
     recs = judge_records(tmp_path)
@@ -182,7 +191,7 @@ def test_judge_verdict_keys_void_reply_even_with_escalate(tmp_path, home):
 
 def test_judge_malformed_ignored(tmp_path, home):
     body = "import sys\nsys.stdin.read()\nprint('not json at all')"
-    set_policy(tmp_path, {"judge": {
+    set_user_policy(home, {"judge": {
         "command": make_judge(tmp_path, body)}})
     proc = drive(pretool("git status"), tmp_path, {"HOME": str(home)})
     assert decision_of(proc) == "allow"
@@ -192,7 +201,7 @@ def test_judge_malformed_ignored(tmp_path, home):
 
 def test_judge_crash_ignored(tmp_path, home):
     body = "import sys\nsys.stdin.read()\nraise SystemExit(3)"
-    set_policy(tmp_path, {"judge": {
+    set_user_policy(home, {"judge": {
         "command": make_judge(tmp_path, body)}})
     proc = drive(pretool("rm old.log"), tmp_path, {"HOME": str(home)})
     assert decision_of(proc) == "ask"
@@ -203,7 +212,7 @@ def test_judge_crash_ignored(tmp_path, home):
 def test_judge_timeout_ignored_and_bounded(tmp_path, home):
     body = ("import sys, time\nsys.stdin.read()\ntime.sleep(30)\n"
             "print('{\"escalate\": true}')")
-    set_policy(tmp_path, {"judge": {
+    set_user_policy(home, {"judge": {
         "command": make_judge(tmp_path, body), "timeout_ms": 200}})
     start = time.monotonic()
     proc = drive(pretool("git status"), tmp_path, {"HOME": str(home)})
@@ -215,7 +224,7 @@ def test_judge_timeout_ignored_and_bounded(tmp_path, home):
 
 
 def test_judge_no_raise_keeps_verdict(tmp_path, home):
-    set_policy(tmp_path, {"judge": {
+    set_user_policy(home, {"judge": {
         "command": make_judge(tmp_path, NO_RAISE)}})
     proc = drive(pretool("rm old.log"), tmp_path, {"HOME": str(home)})
     assert decision_of(proc) == "ask"
@@ -227,7 +236,7 @@ def test_judge_reason_sanitized_and_capped(tmp_path, home):
     body = ("import json, sys\njson.load(sys.stdin)\n"
             "print(json.dumps({'escalate': True, 'reason':"
             " 'bad\\x1b[31m' + 'x' * 1000}))")
-    set_policy(tmp_path, {"judge": {
+    set_user_policy(home, {"judge": {
         "command": make_judge(tmp_path, body)}})
     proc = drive(pretool("git status"), tmp_path, {"HOME": str(home)})
     assert decision_of(proc) == "ask"
@@ -253,7 +262,7 @@ def test_judge_policy_enabled_false(tmp_path, home):
 
 def test_judge_skipped_in_audit_mode(tmp_path, home):
     cmd, marker = marker_judge(tmp_path, {"escalate": True})
-    set_policy(tmp_path, {"judge": {"command": cmd}})
+    set_user_policy(home, {"judge": {"command": cmd}})
     proc = drive(pretool("git status"), tmp_path, {"HOME": str(home)},
                  mode="audit")
     assert proc.stdout.strip() == ""  # observe-only: nothing emitted
@@ -262,7 +271,7 @@ def test_judge_skipped_in_audit_mode(tmp_path, home):
 
 def test_judge_skips_ungated_tool(tmp_path, home):
     cmd, marker = marker_judge(tmp_path, {"escalate": True})
-    set_policy(tmp_path, {"judge": {"command": cmd}})
+    set_user_policy(home, {"judge": {"command": cmd}})
     payload = {"hook_event_name": "PreToolUse", "session_id": "r9",
                "tool_name": "WebFetch",
                "tool_input": {"url": "https://example.com"}}
@@ -278,7 +287,7 @@ def test_judge_brief_contract(tmp_path, home):
             "open(%r, 'w').write(json.dumps(brief))\n"
             "print(json.dumps({'escalate': False}))"
             % str(brief_path))
-    set_policy(tmp_path, {"judge": {
+    set_user_policy(home, {"judge": {
         "command": make_judge(tmp_path, body)}})
     drive(pretool("git status"), tmp_path, {"HOME": str(home)})
     brief = json.loads(brief_path.read_text(encoding="utf-8"))
@@ -418,4 +427,4 @@ def test_hook_module_has_round9_rules():
     assert hook._judge_config is not None
     assert hook._ASI_BY_RULE["seatbelt-judge"] == "ASI02"
     assert hook._ASI_BY_RULE["seatbelt-skill-drift"] == "ASI04"
-    assert hook.VERSION == "0.3.3"
+    assert hook.VERSION == "0.3.5"

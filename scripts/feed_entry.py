@@ -29,6 +29,22 @@ ROOT = Path(__file__).resolve().parent.parent
 _ID_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
 
 
+def _safe_destination(path, expected_parent):
+    """Refuse symlink destinations and symlinked parent directories.
+
+    The slug check prevents lexical traversal; this check prevents a
+    pre-planted symlink in an untrusted checkout from redirecting writes
+    outside the repository (or into a different repository directory).
+    """
+    root = ROOT.resolve()
+    expected = root / expected_parent
+    try:
+        parent = path.parent.resolve(strict=True)
+    except OSError:
+        return False
+    return parent == expected and not path.is_symlink()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--id", required=True)
@@ -63,6 +79,19 @@ def main():
         return 2
 
     index_path = ROOT / "feed" / "index.json"
+    rule_path = ROOT / "feed" / "rules" / (args.id + ".json")
+    changelog = ROOT / "CHANGELOG.md"
+    if not _safe_destination(index_path, Path("feed")) or \
+            not _safe_destination(rule_path, Path("feed/rules")) or \
+            not _safe_destination(changelog, Path(".")):
+        print("REFUSED: a feed output path or parent directory is a symlink "
+              "or resolves outside its expected repository directory.",
+              file=sys.stderr)
+        return 2
+    if rule_path.exists():
+        print("REFUSED: feed rule file %s already exists." % rule_path,
+              file=sys.stderr)
+        return 2
     index = json.loads(index_path.read_text(encoding="utf-8"))
     if any(e["id"] == args.id for e in index["entries"]):
         print("REFUSED: feed entry %s already exists." % args.id,
@@ -82,10 +111,8 @@ def main():
         "deny_patterns": [],
         "ask_patterns": ["TODO-detector-pattern"],
     }
-    rule_path = ROOT / "feed" / "rules" / (args.id + ".json")
     rule_path.write_text(json.dumps(stub, indent=1) + "\n", encoding="utf-8")
 
-    changelog = ROOT / "CHANGELOG.md"
     line = ("- Feed: %s — %s (rules: %s; bench: %s)\n"
             % (args.id, args.incident, ", ".join(args.rule_id),
                ", ".join(args.bench_case)))

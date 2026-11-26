@@ -4,6 +4,55 @@
 
 (Disaster-feed entries land here first — see docs/FEED_RUNBOOK.md.)
 
+## 0.3.5 — 2026-11-26
+
+Security release (round-14 finding F-14-01, Phase 1 of the approved
+0.4.0 design): the judge trust boundary.
+
+- **Project-supplied judge commands no longer run (breaking change).**
+  Before 0.3.5, the judge command was read from the PROJECT file
+  `.seatbelt/policy.json` and executed through a shell with the
+  user's permissions whenever an allow/ask verdict was reached — a
+  cloned repository could execute arbitrary code on the back of a
+  harmless `git status`. The escalation-only contract bounded what
+  a judge could do to verdicts, but not what the judge process
+  itself did on the host. Judges must now be configured by the user:
+  via `SEATBELT_JUDGE_COMMAND`, the user's own
+  `~/.seatbelt/policy.json`, or the new hash-pinned judge registry
+  (`~/.seatbelt/judges.json`). A project policy may still switch the
+  seam off (`"enabled": false`) or propose a judge by name; a
+  proposed *command* is never executed — it is audit-logged
+  (`untrusted-project-judge`) and surfaced by `--doctor`.
+- **Judge registry with hash pinning.** `--register-judge ID --exec
+  PATH [--arg VALUE]... [--timeout-ms N]` records a judge executable
+  and the sha256 of its bytes in `~/.seatbelt/judges.json`; `--judges`
+  lists entries. Policies (user or project) may reference a judge by
+  `"name"`; the name resolves only against the user's registry, the
+  hash is re-verified before every run (a mismatch is refused and
+  logged as `hash-mismatch`), and registry judges execute without a
+  shell. Unpinned entries never run.
+- Judge timeouts are taken only from the environment or the trusted
+  source (user policy / registry entry), never from the project
+  file. `--doctor` now reports the judge's source and flags
+  project-proposed commands as NOT trusted.
+
+## 0.3.4 — 2026-11-26
+
+Patch release from the adversarial review follow-up on 0.3.3 (round 13).
+All three findings were reproduced on the published 0.3.3 tree before
+adoption, and the full test suite (388 tests) passes on the patched tree.
+
+- **PostToolUse response truncation**: structural truncation (including list
+  items beyond the first 50, excessive nesting, and node-budget exhaustion)
+  now raises an injection taint instead of silently skipping uninspected
+  content.
+- **GitHub Action input injection**: caller-controlled `inputs.files` is now
+  passed through an environment variable and parsed as data, not interpolated
+  into the generated Bash script.
+- **Disaster-feed symlink escape**: `feed_entry.py` now refuses symlinked output
+  files or parent directories, preventing a slug-valid entry from redirecting
+  writes outside `feed/rules/`.
+
 ## 0.3.3 — 2026-11-26
 
 Patch release from the independent security review of 0.3.2 (round 12),
