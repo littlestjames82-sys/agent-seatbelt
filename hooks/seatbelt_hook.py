@@ -54,7 +54,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 GATED_TOOLS = {"Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 FILE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit", "Read"}
 VALID_MODES = {"enforce", "audit", "strict", "shadow"}

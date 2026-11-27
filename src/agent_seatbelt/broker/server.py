@@ -342,6 +342,8 @@ class Broker:
             "stdout": bytes(out_buf.data),
             "stderr": bytes(err_buf.data),
             "truncated": out_buf.truncated or err_buf.truncated,
+            "error": None,
+            "exec_root": None,
         }
 
     def _execute_authorized(self, machine, normalized):
@@ -387,7 +389,6 @@ class Broker:
             machine.error = "execution failed: %s" % exc
             self._transition(machine, "FAILED", reason=machine.error)
             return
-        self._transition(machine, "VERIFYING")
         try:
             redact = authz.load_hook().redact
         except Exception:
@@ -405,15 +406,34 @@ class Broker:
             "proc_mode": outcome.get("proc_mode"),
             "sandbox_id": sandbox_id,
             "mode": self.mode,
+            "error": outcome.get("error"),
+            "exec_root": outcome.get("exec_root"),
         }
         machine.result = result
+        environment = {"sandbox_id": sandbox_id,
+                       "mechanism": outcome["mechanism"],
+                       "proc_mode": outcome.get("proc_mode"),
+                       "mode": self.mode}
+        if outcome.get("exec_root"):
+            environment["exec_root"] = outcome["exec_root"]
+        if outcome.get("error"):
+            # Sandbox setup or exec failed: the execution never
+            # ran. Fail closed with the concrete reason recorded
+            # — never a bare exit code in a COMPLETED state.
+            machine.error = outcome["error"]
+            self._transition(machine, "FAILED",
+                             reason=machine.error,
+                             environment=environment,
+                             result={"exit_code": outcome["exit_code"],
+                                     "timed_out": outcome["timed_out"],
+                                     "limit_exceeded":
+                                         outcome["limit_exceeded"],
+                                     "error": outcome["error"]})
+            return
+        self._transition(machine, "VERIFYING")
         final = "TERMINATED" if outcome["timed_out"] else "COMPLETED"
         self._transition(machine, final,
-                         environment={"sandbox_id": sandbox_id,
-                                      "mechanism": outcome["mechanism"],
-                                      "proc_mode": outcome.get(
-                                          "proc_mode"),
-                                      "mode": self.mode},
+                         environment=environment,
                          result={"exit_code": outcome["exit_code"],
                                  "timed_out": outcome["timed_out"],
                                  "limit_exceeded":

@@ -4,6 +4,49 @@
 
 (Disaster-feed entries land here first — see docs/FEED_RUNBOOK.md.)
 
+## 0.4.1 — 2026-11-26
+
+Broker sandbox honesty fix. In 0.4.0, a sandbox that could not
+run the requested executable reported a bare exit code (126/127)
+in a COMPLETED state with empty output — the failure was
+invisible. That is how the 0.4.0 CI run failed: on hosted
+runners the Python interpreter lives under /opt/hostedtoolcache,
+outside the sandbox's default filesystem view (/usr, /bin,
+/sbin, /lib, /lib64), so every real-exec sandbox test died
+silently while the suite elsewhere stayed green.
+
+- **Executable coverage.** When the broker builds the sandbox
+  view, it resolves the request's executable; if it lives
+  outside the bound roots, its top-level root (e.g. /opt, /srv)
+  is bound read-only into the view and the added bind is
+  recorded in the result (`exec_root`). Interpreters installed
+  under /opt, pyenv-style roots, or vendored toolchain roots
+  now run.
+- **Fail closed, with the reason.** Any sandbox setup failure —
+  namespace creation, a mount or bind (including an executable
+  root the kernel refuses to bind), or exec of the target —
+  now ends the execution in state FAILED with the concrete
+  error recorded in the result (`error`), never a bare exit
+  code in a COMPLETED state. An executable that does not exist,
+  or that lives under a root that is never bound (the user's
+  home is shadowed, never bound; the sandbox constructs its
+  own /tmp, /proc, /sys, /dev), fails the same honest way.
+- **Honest probing.** The broker's isolation probe now runs a
+  trivial command through the real launcher end to end instead
+  of only testing unshare: an environment that cannot actually
+  run sandboxes is detected at broker startup (and reported by
+  --doctor / the test battery's skip reason) instead of
+  failing per-execution. Some hosted CI runners restrict the
+  namespace operations the sandbox needs; the broker now
+  detects and reports that up front.
+- The sandbox test battery gained a positive control (a
+  trivial sandboxed exec must succeed before any negative
+  result is trusted) and regression tests for executable
+  coverage and fail-closed errors.
+
+No policy, hook, or protocol behavior changes; the result
+schema gains two additive fields (`error`, `exec_root`).
+
 ## 0.4.0 — 2026-11-26
 
 Phases 2–3 of the approved Ghost Execution Broker design: a

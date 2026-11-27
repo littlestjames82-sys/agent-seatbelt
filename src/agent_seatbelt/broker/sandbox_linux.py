@@ -144,6 +144,73 @@ def _write(path, text):
         fh.write(text)
 
 
+# Roots the sandbox constructs for itself — an empty private
+# /tmp, an empty /proc placeholder, /sys, /dev nodes. Binding the
+# host's versions over them would break the view or expose host
+# state, so an executable living under one can never be covered
+# by a bind.
+_UNBINDABLE_ROOTS = ("/tmp", "/proc", "/sys", "/dev")
+
+
+def _is_covered(path, roots):
+    for root in roots:
+        root = root.rstrip("/")
+        if path == root or path.startswith(root + "/"):
+            return True
+    return False
+
+
+def executable_coverage(argv0, cwd, home, workspace, extended_dirs):
+    """Decide how the request's executable will exist inside the
+    sandbox view. Returns (exec_root, problem):
+
+    - (None, None): already covered by the planned binds, or a
+      bare name the in-sandbox PATH search resolves under covered
+      roots (every directory on the sandbox PATH is under /usr or
+      /bin).
+    - (root, None): not covered — bind `root` (the executable's
+      top-level path component) read-only to cover it. This is
+      what makes interpreters installed outside the default
+      system view work: /opt/hostedtoolcache on hosted CI
+      runners, /srv, a vendored toolchain root.
+    - (None, problem): cannot be covered — the execution must
+      fail closed with `problem` as the recorded reason. The
+      user's home is never bound into the view (an empty shadow
+      stands at its path), and the sandbox's own /tmp, /proc,
+      /sys and /dev are constructed, not bound, so executables
+      under those roots are uncoverable by design.
+    """
+    if "/" not in argv0:
+        return None, None
+    if os.path.isabs(argv0):
+        resolved = os.path.realpath(argv0)
+    else:
+        resolved = os.path.realpath(os.path.join(cwd, argv0))
+    covered = list(_SYSTEM_DIRS) + [workspace] + [
+        (e["path"] if isinstance(e, dict) else e)
+        for e in extended_dirs]
+    if _is_covered(resolved, covered):
+        return None, None
+    if not os.path.exists(resolved):
+        return None, ("executable %s does not exist on the host "
+                      "and is not covered by the sandbox view"
+                      % argv0)
+    parts = [p for p in resolved.split("/") if p]
+    if len(parts) < 2:
+        return None, ("executable %s cannot be covered by the "
+                      "sandbox view" % argv0)
+    root = "/" + parts[0]
+    home_parts = [p for p in home.split("/") if p]
+    home_root = "/" + home_parts[0] if home_parts else None
+    if root in _UNBINDABLE_ROOTS or root == home_root:
+        return None, ("executable %s lives under %s, which is "
+                      "never bound into the sandbox view (the "
+                      "user's home is shadowed, never bound, and "
+                      "the sandbox constructs its own /tmp, /proc, "
+                      "/sys and /dev)" % (argv0, root))
+    return root, None
+
+
 def _setup_userns():
     euid, egid = os.geteuid(), os.getegid()
     _unshare(CLONE_NEWUSER)
@@ -168,6 +235,22 @@ def _build_root(spec, newroot):
     for sysdir in _SYSTEM_DIRS:
         if Path(sysdir).is_dir():
             _bind(sysdir, str(root / sysdir.lstrip("/")), readonly=True)
+    # The executable's own root, when executable_coverage() found
+    # it outside the default view (e.g. /opt, /srv): bound
+    # read-only at its own path so the target exists inside. A
+    # kernel refusal here (some container runtimes refuse binds
+    # of particular roots) propagates as a setup failure — the
+    # execution fails closed with the reason recorded, never an
+    # opaque exit code.
+    exec_root = spec.get("exec_root")
+    if exec_root:
+        try:
+            _bind(exec_root, str(root / exec_root.lstrip("/")),
+                  readonly=True)
+        except OSError as exc:
+            raise OSError(
+                "could not bind executable root %s into the "
+                "sandbox view: %s" % (exec_root, exc)) from exc
     etc = root / "etc"
     etc.mkdir(parents=True, exist_ok=True)
     for name in _ETC_FILES:
@@ -290,6 +373,19 @@ def _apply_rlimits(limits, nproc_baseline=0):
         pass
 
 
+def _write_error_file(status_path, stage, message):
+    """Record a sandbox setup/exec failure next to the status
+    file, where run_sandboxed() reads it and the broker turns it
+    into a FAILED execution with the reason attached. Best
+    effort: the launcher's stderr and exit code remain as the
+    fallback signal."""
+    try:
+        _write(status_path + ".error", json.dumps(
+            {"stage": stage, "error": message}))
+    except OSError:
+        pass
+
+
 def _launcher_main(spec_path, status_path):
     with open(spec_path, encoding="utf-8") as fh:
         spec = json.load(fh)
@@ -304,9 +400,18 @@ def _launcher_main(spec_path, status_path):
         _build_root(spec, newroot)
         nproc_baseline = _count_uid_processes(os.getuid())
 
+        # Exec-error pipe: the write end is CLOEXEC, so a
+        # successful exec closes it silently; if anything in the
+        # child fails before or during exec, the child writes the
+        # concrete error here first. This is how the broker tells
+        # "the sandbox could not run this" apart from a target
+        # that simply exited 127 — the failure gets a reason, not
+        # a bare exit code with empty output.
+        err_r, err_w = os.pipe2(os.O_CLOEXEC)
         child = os.fork()
         if child == 0:
             # pid 1 in the new pid namespace.
+            os.close(err_r)
             try:
                 proc_mode = "fresh"
                 try:
@@ -338,14 +443,37 @@ def _launcher_main(spec_path, status_path):
                     "TERM": "dumb",
                 }
                 os.execvpe(spec["argv"][0], spec["argv"], env)
-            except BaseException:
+            except BaseException as exc:
+                try:
+                    os.write(err_w, ("%s: %s" % (
+                        type(exc).__name__, exc)).encode(
+                            "utf-8", "replace")[:4096])
+                except OSError:
+                    pass
                 os._exit(127)
+        os.close(err_w)
         # Launcher (parent): report the namespace init's host pid,
         # then wait and propagate its status.
         if status_path:
             _write(status_path, json.dumps(
                 {"init_pid": child, "newroot": newroot}))
         _pid, status = os.waitpid(child, 0)
+        exec_error = b""
+        try:
+            while True:
+                chunk = os.read(err_r, 4096)
+                if not chunk:
+                    break
+                exec_error += chunk
+        except OSError:
+            pass
+        os.close(err_r)
+        if exec_error and status_path:
+            _write_error_file(
+                status_path, "exec",
+                "sandbox could not execute %s: %s" % (
+                    spec["argv"][0],
+                    exec_error.decode("utf-8", "replace")))
         if os.WIFEXITED(status):
             return os.WEXITSTATUS(status)
         if os.WIFSIGNALED(status):
@@ -360,9 +488,30 @@ def _launcher_main(spec_path, status_path):
             pass
 
 
+_probe_cache = None
+
+
 def probe():
-    """Can this process create the namespaces the launcher needs?
-    Probed in a subprocess so the broker never unshares itself."""
+    """Can this environment actually run a sandboxed execution?
+
+    Honest probing: a bare unshare(CLONE_NEWUSER) succeeding is
+    NOT evidence the launcher works — hosted CI runners restrict
+    later steps (mounts, exec inside the view) while leaving
+    unshare itself permitted, which used to surface only as
+    opaque per-execution failures. So the probe exercises the
+    real launcher path end to end: it runs /bin/true through
+    run_sandboxed() and requires a clean exit. The result is
+    cached for the life of the process — broker startup and the
+    test suite's skip checks each pay for one real sandbox run,
+    not one per call."""
+    global _probe_cache
+    if _probe_cache is not None:
+        return _probe_cache
+    _probe_cache = _probe_real()
+    return _probe_cache
+
+
+def _probe_real():
     code = (
         "import ctypes,sys;"
         "libc=ctypes.CDLL('libc.so.6',use_errno=True);"
@@ -371,9 +520,39 @@ def probe():
     try:
         proc = subprocess.run([sys.executable, "-c", code],
                               capture_output=True, timeout=15)
-        return proc.returncode == 0
+        if proc.returncode != 0:
+            return False
     except Exception:
         return False
+    tmp = tempfile.mkdtemp(prefix="seatbelt-probe-")
+    ws = os.path.join(tmp, "ws")
+    os.mkdir(ws)
+    try:
+        spec = {
+            "sandbox_id": "probe",
+            "argv": ["/bin/true"],
+            "cwd": ws,
+            "workspace": ws,
+            "profile": "read-only",
+            "extended_dirs": [],
+            "network": "none",
+            "home": os.path.join(tmp, "home"),
+            "limits": {"cpu_seconds": 15, "address_space_mb": 512,
+                       "memory_mb": 512, "file_size_mb": 16,
+                       "open_files": 256, "processes": 32},
+            "timeout_seconds": 15,
+        }
+        outcome = run_sandboxed(spec, 65536)
+        return outcome.get("error") is None and \
+            outcome.get("exit_code") == 0
+    except Exception:
+        return False
+    finally:
+        for path in (ws, tmp):
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
 
 
 def _ns_process_count(init_pid):
@@ -447,12 +626,42 @@ def run_sandboxed(spec, output_cap, on_spawn=None):
     are known, so the broker can record them in its run manifest
     for crash recovery. Returns a result dict:
     {exit_code, timed_out, limit_exceeded, mechanism, init_pid,
-     sandbox_id, stdout, stderr, truncated}."""
+     sandbox_id, stdout, stderr, truncated, error, exec_root}.
+    `error` is None on every path where the target actually ran;
+    a sandbox setup or exec failure sets it to the concrete
+    reason (and exit_code may then be None), so callers can fail
+    the execution closed instead of reporting an opaque code.
+    `exec_root` records the extra read-only root bind added to
+    cover the executable, when one was needed."""
     import threading
 
     sandbox_id = spec["sandbox_id"]
     spec_path = status_path = None
     proc = None
+    # Executable coverage is decided before anything is spawned:
+    # an uncoverable target fails closed right here with the
+    # reason in the outcome, and a coverable one gets its root
+    # added to the spec so the launcher binds it into the view.
+    exec_root, problem = executable_coverage(
+        spec["argv"][0], spec["cwd"], spec["home"],
+        spec["workspace"], spec.get("extended_dirs", []))
+    if problem is not None:
+        return {
+            "exit_code": None,
+            "timed_out": False,
+            "limit_exceeded": None,
+            "mechanism": "none (sandbox setup failed)",
+            "proc_mode": None,
+            "init_pid": None,
+            "sandbox_id": sandbox_id,
+            "stdout": b"",
+            "stderr": b"",
+            "truncated": False,
+            "error": problem,
+            "exec_root": None,
+        }
+    if exec_root:
+        spec = dict(spec, exec_root=exec_root)
     try:
         fd, spec_path = tempfile.mkstemp(prefix="seatbelt-spec-")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -534,10 +743,17 @@ def run_sandboxed(spec, output_cap, on_spawn=None):
             except OSError:
                 pass
         proc_mode = None
+        error = None
         if status_path:
             try:
                 with open(status_path + ".child", encoding="utf-8") as fh:
                     proc_mode = json.load(fh).get("proc_mode")
+            except (OSError, ValueError):
+                pass
+            try:
+                with open(status_path + ".error",
+                          encoding="utf-8") as fh:
+                    error = json.load(fh).get("error")
             except (OSError, ValueError):
                 pass
         return {
@@ -552,10 +768,13 @@ def run_sandboxed(spec, output_cap, on_spawn=None):
             "stdout": bytes(out_buf.data),
             "stderr": bytes(err_buf.data),
             "truncated": out_buf.truncated or err_buf.truncated,
+            "error": error,
+            "exec_root": exec_root,
         }
     finally:
         for p in (spec_path, status_path,
-                  (status_path + ".child") if status_path else None):
+                  (status_path + ".child") if status_path else None,
+                  (status_path + ".error") if status_path else None):
             if p:
                 try:
                     os.unlink(p)
@@ -646,6 +865,9 @@ def _main(argv=None):
         return _launcher_main(spec_path, status_path)
     except OSError as exc:
         sys.stderr.write("sandbox launcher failed: %s\n" % exc)
+        if status_path:
+            _write_error_file(status_path, "setup",
+                              "sandbox setup failed: %s" % exc)
         return 126
 
 

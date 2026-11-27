@@ -12,6 +12,8 @@ than passing vacuously.
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -63,9 +65,24 @@ def broker(env):
 
 
 @pytest.fixture()
-def client(broker):
+def client(broker, env):
     c = BrokerClient()
     c.open("escape-artist")
+    # Positive control: one trivial sandboxed exec must complete
+    # cleanly. If the environment cannot actually run sandboxes,
+    # every negative test below could pass vacuously (a dead
+    # sandbox "blocks" everything) — this makes that failure
+    # loud and singular instead.
+    snap = c.execute(argv=["/bin/true"], cwd=str(env["ws"]),
+                     filesystem=["workspace-write"],
+                     timeout_seconds=30)
+    assert snap["state"] == "COMPLETED" and \
+        snap["result"]["exit_code"] == 0, (
+            "sandbox positive control failed: a trivial /bin/true "
+            "execution did not complete cleanly (state=%r, "
+            "error=%r) — this environment cannot run sandboxes, "
+            "so the escape battery's negative results would be "
+            "meaningless" % (snap.get("state"), snap.get("error")))
     return c
 
 
@@ -248,6 +265,107 @@ def test_detached_children_die_with_namespace(client, env):
     time.sleep(0.8)
     assert heartbeat.read_text(
         encoding="utf-8").splitlines() == lines  # and then died
+
+
+# ── executable coverage & fail-closed errors (0.4.1) ─────────────────
+#
+# The 0.4.0 CI failure: on hosted runners the interpreter lives
+# under /opt/hostedtoolcache — outside the sandbox's default
+# filesystem view — so every real-exec test died with a bare exit
+# 126/127 in a COMPLETED state, empty output, no reason recorded.
+# 0.4.1 binds the executable's root into the view when it can,
+# and fails closed (FAILED + the concrete reason) when it cannot.
+
+def _uncovered_interpreter():
+    """An interpreter under a root the sandbox does not bind by
+    default (/srv). Prefers the pre-placed fixture; otherwise
+    creates the same layout when the environment permits."""
+    cand = Path("/srv/fakepy/python3.12")
+    if cand.is_file() and os.access(cand, os.X_OK):
+        return cand, "/srv"
+    root = Path("/srv/seatbelt-exec-root")
+    target = root / "python3"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            shutil.copy("/usr/bin/python3", str(target))
+    except OSError:
+        return None, None
+    if target.is_file() and os.access(target, os.X_OK):
+        return target, "/srv"
+    return None, None
+
+
+def test_executable_under_uncovered_root_works(client, env):
+    cand, root = _uncovered_interpreter()
+    if cand is None:
+        pytest.skip("no interpreter fixture under an uncovered "
+                    "root (/srv) and no permission to create one")
+    host = subprocess.run([str(cand), "-c", "print('ok')"],
+                          capture_output=True)
+    if host.returncode != 0:
+        pytest.skip("interpreter fixture does not run on the host")
+    snap = run(client, env, [str(cand), "-c",
+                             "print('exec-root-ok')"])
+    assert snap["state"] == "COMPLETED"
+    assert snap["result"]["exit_code"] == 0
+    assert "exec-root-ok" in snap["result"]["stdout_tail"]
+    # The added bind is recorded, not silent.
+    assert snap["result"]["exec_root"] == root
+
+
+def test_nonexistent_executable_fails_closed_with_reason(client,
+                                                          env):
+    snap = run(client, env, ["/usr/bin/seatbelt-no-such-binary"])
+    assert snap["state"] == "FAILED"
+    assert snap.get("error")
+    assert "seatbelt-no-such-binary" in snap["error"]
+    assert snap["result"]["error"] == snap["error"]
+
+
+def test_executable_under_home_fails_closed_with_reason(client,
+                                                         env):
+    # The user's home is never bound into the sandbox view, so an
+    # interpreter installed there cannot be covered — the
+    # execution must fail closed with the reason recorded, not
+    # die as a bare 127 in a COMPLETED state.
+    bindir = env["home"] / "bin"
+    bindir.mkdir()
+    target = bindir / "python3"
+    shutil.copy("/usr/bin/python3", str(target))
+    snap = run(client, env, [str(target), "-c", "print('never')"])
+    assert snap["state"] == "FAILED"
+    assert snap.get("error")
+    assert "sandbox view" in snap["error"]
+
+
+def test_executable_coverage_decisions(tmp_path):
+    cov = sandbox_linux.executable_coverage
+    # Covered system path and bare PATH names need no extra bind.
+    assert cov("/usr/bin/python3", "/ws", "/home/u", "/ws",
+               []) == (None, None)
+    assert cov("python3", "/ws", "/home/u", "/ws",
+               []) == (None, None)
+    # An existing interpreter under an uncovered root gets the
+    # root bind.
+    cand, _root = _uncovered_interpreter()
+    if cand is not None:
+        assert cov(str(cand), "/ws", "/home/u", "/ws",
+                   []) == ("/srv", None)
+    # A nonexistent path under an uncovered root is a recorded
+    # problem, not a bind attempt.
+    _r, problem = cov("/srv/no-such-dir-xyz/python3", "/ws",
+                      "/home/u", "/ws", [])
+    assert problem and "does not exist" in problem
+    # An existing file under the home root can never be covered:
+    # the home is shadowed, never bound.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    target = bindir / "python3"
+    shutil.copy("/usr/bin/python3", str(target))
+    _r, problem = cov(str(target), "/ws", str(tmp_path),
+                      "/ws", [])
+    assert problem and "sandbox view" in problem
 
 
 def test_sandbox_reports_honest_mechanism(client, env):
