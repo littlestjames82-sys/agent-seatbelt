@@ -22,6 +22,7 @@ import pytest
 _PKG = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PKG / "src"))
 
+from agent_seatbelt.broker import sandbox_linux  # noqa: E402
 from agent_seatbelt.broker.client import (  # noqa: E402
     BrokerClient,
     BrokerUnavailable,
@@ -96,8 +97,13 @@ def pid_alive(pid):
         return False
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"),
-                    reason="broker crash test is Linux-scoped")
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") and sandbox_linux.probe()),
+    reason="broker crash test needs a working namespace sandbox — "
+           "the real-launcher probe says this environment cannot "
+           "run one (e.g. hosted CI runners that restrict the "
+           "namespace operations), so it skips loudly instead of "
+           "failing on a sandbox that can never register")
 def test_broker_kill_mid_execution(env):
     broker = start_broker(env)
     client = BrokerClient()
